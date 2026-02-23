@@ -25,6 +25,7 @@ struct AppFeature {
 		var transcription: TranscriptionFeature.State = .init()
 		var settings: SettingsFeature.State = .init()
 		var history: HistoryFeature.State = .init()
+		var continuousListening: ContinuousListeningFeature.State = .init()
 		var activeTab: ActiveTab = .settings
 		@Shared(.hexSettings) var hexSettings: HexSettings
 		@Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
@@ -40,6 +41,7 @@ struct AppFeature {
     case transcription(TranscriptionFeature.Action)
     case settings(SettingsFeature.Action)
     case history(HistoryFeature.Action)
+    case continuousListening(ContinuousListeningFeature.Action)
     case setActiveTab(ActiveTab)
     case task
     case pasteLastTranscript
@@ -74,18 +76,23 @@ struct AppFeature {
       HistoryFeature()
     }
 
+    Scope(state: \.continuousListening, action: \.continuousListening) {
+      ContinuousListeningFeature()
+    }
+
     Reduce { state, action in
       switch action {
       case .binding:
         return .none
-        
+
       case .task:
         return .merge(
           startPasteLastTranscriptMonitoring(),
+          startContinuousListeningEnterMonitoring(),
           ensureSelectedModelReadiness(),
           startPermissionMonitoring()
         )
-        
+
       case .pasteLastTranscript:
         @Shared(.transcriptionHistory) var transcriptionHistory: TranscriptionHistory
         guard let lastTranscript = transcriptionHistory.history.first?.text else {
@@ -94,7 +101,16 @@ struct AppFeature {
         return .run { _ in
           await pasteboard.paste(lastTranscript)
         }
-        
+
+      case .continuousListening:
+        return .none
+
+      case .transcription(.hotKeyPressed):
+        return .send(.continuousListening(.toggleMode))
+
+      case .transcription(.hotKeyReleased):
+        return .none
+
       case .transcription(.modelMissing):
         HexLog.app.notice("Model missing - activating app and switching to settings")
         state.activeTab = .settings
@@ -253,7 +269,39 @@ struct AppFeature {
     }
   }
 
+  private func startContinuousListeningEnterMonitoring() -> Effect<Action> {
+    .run { send in
+      let token = keyEventMonitor.handleKeyEvent { keyEvent in
+        guard let key = keyEvent.key, key == .return else {
+          return false
+        }
+
+        // Only intercept when continuous listening is active —
+        // we read state via the store synchronously on MainActor
+        let store = HexApp.appStore
+        guard store.state.continuousListening.isActive else {
+          return false
+        }
+
+        MainActor.assumeIsolated {
+          send(.continuousListening(.dispatchText))
+        }
+        return true
+      }
+
+      defer { token.cancel() }
+
+      await withTaskCancellationHandler {
+        while !Task.isCancelled {
+          try? await Task.sleep(for: .seconds(60))
+        }
+      } onCancel: {
+        token.cancel()
+      }
+    }
+  }
 }
+
 
 struct AppView: View {
   @Bindable var store: StoreOf<AppFeature>

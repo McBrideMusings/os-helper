@@ -96,14 +96,12 @@ struct TranscriptionFeature {
       // MARK: - HotKey Flow
 
       case .hotKeyPressed:
-        // If we're transcribing, send a cancel first. Otherwise start recording immediately.
-        // We'll decide later (on release) whether to keep or discard the recording.
-        return handleHotKeyPressed(isTranscribing: state.isTranscribing)
+        // Routed by AppFeature to continuous listening toggle
+        return .none
 
       case .hotKeyReleased:
-        // If we're currently recording, then stop. Otherwise, just cancel
-        // the delayed "startRecording" effect if we never actually started.
-        return handleHotKeyReleased(isRecording: state.isRecording)
+        // Continuous listening mode ignores release
+        return .none
 
       // MARK: - Recording Flow
 
@@ -162,6 +160,7 @@ private extension TranscriptionFeature {
     .run { send in
       var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
+      @Shared(.isContinuousListeningActive) var isContinuousListeningActive: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 
       // Handle incoming input events (keyboard and mouse)
@@ -189,19 +188,14 @@ private extension TranscriptionFeature {
           // Process the key event
           switch hotKeyProcessor.process(keyEvent: keyEvent) {
           case .startRecording:
-            // If double-tap lock is triggered, we start recording immediately
-            if hotKeyProcessor.state == .doubleTapLock {
-              Task { await send(.startRecording) }
-            } else {
-              Task { await send(.hotKeyPressed) }
-            }
-            // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
-            // But if useDoubleTapOnly is true, always intercept the key
+            // Toggle continuous listening mode
+            Task { await send(.hotKeyPressed) }
             return hexSettings.useDoubleTapOnly || keyEvent.key != nil
 
           case .stopRecording:
+            // In continuous mode, ignore release
             Task { await send(.hotKeyReleased) }
-            return false // or `true` if you want to intercept
+            return false
 
           case .cancel:
             Task { await send(.cancel) }

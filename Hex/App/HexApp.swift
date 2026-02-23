@@ -22,9 +22,13 @@ struct HexApp: App {
             Button("Settings...") {
                 appDelegate.presentSettingsView()
             }.keyboardShortcut(",")
-			
+
 			Divider()
-			
+
+			ContinuousListeningToggle()
+
+			Divider()
+
 			Button("Quit") {
 				NSApplication.shared.terminate(nil)
 			}.keyboardShortcut("q")
@@ -51,5 +55,15 @@ struct HexApp: App {
 
 				CommandGroup(replacing: .help) {}
 			}
+	}
+}
+
+struct ContinuousListeningToggle: View {
+	var body: some View {
+		let store = HexApp.appStore
+		let isActive = store.state.continuousListening.isActive
+		Button(isActive ? "Stop Continuous Listening" : "Continuous Listening...") {
+			store.send(.continuousListening(.toggleMode))
+		}
 	}
 }

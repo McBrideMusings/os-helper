@@ -8,6 +8,7 @@ private let cacheLogger = HexLog.caches
 class HexAppDelegate: NSObject, NSApplicationDelegate {
 	var invisibleWindow: InvisibleWindow?
 	var settingsWindow: NSWindow?
+	var continuousListeningPanel: ContinuousListeningPanel?
 	var statusItem: NSStatusItem!
 
 	@Dependency(\.soundEffects) var soundEffect
@@ -45,6 +46,7 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		// Then present main views
 		presentMainView()
 		presentSettingsView()
+		startContinuousListeningPanelObserver()
 		NSApp.activate(ignoringOtherApps: true)
 	}
 
@@ -106,6 +108,45 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		settingsWindow.makeKeyAndOrderFront(nil)
 		NSApp.activate(ignoringOtherApps: true)
 		self.settingsWindow = settingsWindow
+	}
+
+	private var continuousListeningObserverTask: Task<Void, Never>?
+
+	private func startContinuousListeningPanelObserver() {
+		continuousListeningObserverTask = Task { @MainActor [weak self] in
+			let store = HexApp.appStore
+			var wasActive = false
+			while !Task.isCancelled {
+				let isActive = store.state.continuousListening.isActive
+				if isActive != wasActive {
+					wasActive = isActive
+					if isActive {
+						self?.showContinuousListeningPanel()
+					} else {
+						self?.hideContinuousListeningPanel()
+					}
+				}
+				try? await Task.sleep(for: .milliseconds(100))
+			}
+		}
+	}
+
+	private func showContinuousListeningPanel() {
+		guard continuousListeningPanel == nil else { return }
+		let store = HexApp.appStore.scope(
+			state: \.continuousListening,
+			action: \.continuousListening
+		)
+		let panel = ContinuousListeningPanel(store: store)
+		panel.orderFront(nil)
+		continuousListeningPanel = panel
+		appLogger.notice("Continuous listening panel shown")
+	}
+
+	private func hideContinuousListeningPanel() {
+		continuousListeningPanel?.orderOut(nil)
+		continuousListeningPanel = nil
+		appLogger.notice("Continuous listening panel hidden")
 	}
 
 	@objc private func handleAppModeUpdate() {

@@ -24,6 +24,10 @@ extension SharedReaderKey
   static var isRemappingScratchpadFocused: Self {
     Self[.inMemory("isRemappingScratchpadFocused"), default: false]
   }
+
+  static var isContinuousListeningActive: Self {
+    Self[.inMemory("isContinuousListeningActive"), default: false]
+  }
 }
 
 // MARK: - Settings Feature
