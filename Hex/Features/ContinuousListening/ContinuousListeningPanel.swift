@@ -58,6 +58,7 @@ struct ContinuousListeningOverlayView: View {
       // Header
       HStack(spacing: 6) {
         PulsingDot()
+        AudioLevelBars(level: store.meterLevel)
         Text("Listening...")
           .font(.system(size: 12, weight: .semibold))
           .foregroundStyle(.primary)
@@ -69,40 +70,30 @@ struct ContinuousListeningOverlayView: View {
 
       Divider()
 
-      // Body
+      // Body — text block list
       ScrollViewReader { proxy in
         ScrollView(.vertical, showsIndicators: false) {
-          VStack(alignment: .leading) {
-            if store.accumulatedText.isEmpty {
+          LazyVStack(alignment: .leading, spacing: 6) {
+            if store.textBlocks.isEmpty {
               Text("Speak to start...")
                 .font(.system(size: 13))
                 .foregroundStyle(.tertiary)
                 .italic()
             } else {
-              Text(store.accumulatedText)
-                .font(.system(size: 13))
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)
-                .id("text-bottom")
+              ForEach(store.textBlocks) { block in
+                TextBlockView(block: block)
+                  .id(block.id)
+              }
             }
           }
           .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .onChange(of: store.accumulatedText) {
-          withAnimation {
-            proxy.scrollTo("text-bottom", anchor: .bottom)
+        .onChange(of: store.textBlocks.count) {
+          if let lastID = store.textBlocks.last?.id {
+            withAnimation {
+              proxy.scrollTo(lastID, anchor: .bottom)
+            }
           }
-        }
-      }
-
-      // Transcribing indicator
-      if store.isTranscribingChunk {
-        HStack(spacing: 4) {
-          ProgressView()
-            .controlSize(.mini)
-          Text("Transcribing...")
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
         }
       }
 
@@ -119,6 +110,68 @@ struct ContinuousListeningOverlayView: View {
     .frame(minHeight: 80, maxHeight: 200)
     .background(.ultraThinMaterial)
     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+  }
+}
+
+// MARK: - Text Block View
+
+private struct TextBlockView: View {
+  let block: TextBlock
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 6) {
+      switch block.status {
+      case .transcribing:
+        ProgressView()
+          .controlSize(.mini)
+          .frame(width: 12, height: 12)
+        Text("Transcribing...")
+          .font(.system(size: 13))
+          .foregroundStyle(.secondary)
+          .italic()
+      case .complete:
+        Text(block.text)
+          .font(.system(size: 13))
+          .foregroundStyle(.primary)
+          .textSelection(.enabled)
+      case .error(let message):
+        Image(systemName: "exclamationmark.triangle.fill")
+          .font(.system(size: 10))
+          .foregroundStyle(.red)
+        Text(message)
+          .font(.system(size: 11))
+          .foregroundStyle(.red)
+          .lineLimit(1)
+      }
+    }
+  }
+}
+
+// MARK: - Audio Level Bars
+
+private struct AudioLevelBars: View {
+  let level: Float
+  private let barCount = 5
+  private let barWeights: [Float] = [0.6, 0.85, 1.0, 0.9, 0.7]
+
+  var body: some View {
+    HStack(spacing: 2) {
+      ForEach(0..<barCount, id: \.self) { index in
+        RoundedRectangle(cornerRadius: 1)
+          .fill(.red.opacity(0.8))
+          .frame(width: 3, height: barHeight(for: index))
+      }
+    }
+    .frame(height: 14)
+    .animation(.easeOut(duration: 0.08), value: level)
+  }
+
+  private func barHeight(for index: Int) -> CGFloat {
+    let weight = barWeights[index]
+    let minHeight: CGFloat = 2
+    let maxHeight: CGFloat = 14
+    let scaled = CGFloat(level * weight)
+    return minHeight + scaled * (maxHeight - minHeight)
   }
 }
 

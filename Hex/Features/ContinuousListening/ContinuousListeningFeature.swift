@@ -38,18 +38,6 @@ struct ContinuousListeningFeature {
     var sourceAppName: String?
     var error: String?
     @Shared(.isContinuousListeningActive) var isContinuousListeningActive: Bool = false
-
-    // Computed properties for backward compatibility with the panel UI
-    var accumulatedText: String {
-      textBlocks
-        .filter { $0.status == .complete }
-        .map(\.text)
-        .joined(separator: "\n")
-    }
-
-    var isTranscribingChunk: Bool {
-      textBlocks.contains { $0.status == .transcribing }
-    }
   }
 
   enum Action {
