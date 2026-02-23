@@ -116,20 +116,34 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		continuousListeningObserverTask = Task { @MainActor [weak self] in
 			let store = HexApp.appStore
 			var wasActive = false
+			var lastScreenID: CGDirectDisplayID?
 			while !Task.isCancelled {
 				let isActive = store.state.continuousListening.isActive
 				if isActive != wasActive {
 					wasActive = isActive
 					if isActive {
 						self?.showContinuousListeningPanel()
+						lastScreenID = self?.continuousListeningPanel?.screen?.displayID
 					} else {
 						self?.hideContinuousListeningPanel()
+						lastScreenID = nil
+					}
+				}
+				// Track which screen the frontmost app is on and move the panel if it changed
+				if isActive, let panel = self?.continuousListeningPanel {
+					let currentScreen = Self.screenOfFrontmostWindow() ?? NSScreen.main
+					let currentID = currentScreen?.displayID
+					if currentID != lastScreenID, let screen = currentScreen {
+						self?.repositionPanel(panel, on: screen)
+						lastScreenID = currentID
 					}
 				}
 				try? await Task.sleep(for: .milliseconds(100))
 			}
 		}
 	}
+
+	private var panelMoveObserver: NSObjectProtocol?
 
 	private func showContinuousListeningPanel() {
 		guard continuousListeningPanel == nil else { return }
@@ -138,15 +152,90 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			action: \.continuousListening
 		)
 		let panel = ContinuousListeningPanel(store: store)
+
+		// Restore saved offset for the current screen
+		if let screen = panel.screen ?? NSScreen.main {
+			let displayKey = String(screen.displayID)
+			if let offset = hexSettings.continuousListeningPanelOffsets[displayKey], offset.count == 2 {
+				let defaultPos = Self.defaultPanelOrigin(on: screen)
+				panel.setFrameOrigin(NSPoint(x: defaultPos.x + offset[0], y: defaultPos.y + offset[1]))
+			}
+		}
+
 		panel.orderFront(nil)
 		continuousListeningPanel = panel
+
+		// Observe drag moves to save offset
+		panelMoveObserver = NotificationCenter.default.addObserver(
+			forName: NSWindow.didMoveNotification,
+			object: panel,
+			queue: .main
+		) { [weak self] _ in
+			self?.savePanelOffset()
+		}
+
 		appLogger.notice("Continuous listening panel shown")
 	}
 
 	private func hideContinuousListeningPanel() {
+		savePanelOffset()
+		if let observer = panelMoveObserver {
+			NotificationCenter.default.removeObserver(observer)
+			panelMoveObserver = nil
+		}
 		continuousListeningPanel?.orderOut(nil)
 		continuousListeningPanel = nil
 		appLogger.notice("Continuous listening panel hidden")
+	}
+
+	private func savePanelOffset() {
+		guard let panel = continuousListeningPanel,
+		      let screen = panel.screen ?? NSScreen.main else { return }
+		let displayKey = String(screen.displayID)
+		let defaultPos = Self.defaultPanelOrigin(on: screen)
+		let dx = panel.frame.origin.x - defaultPos.x
+		let dy = panel.frame.origin.y - defaultPos.y
+		$hexSettings.withLock { $0.continuousListeningPanelOffsets[displayKey] = [dx, dy] }
+	}
+
+	private static func screenOfFrontmostWindow() -> NSScreen? {
+		guard let frontApp = NSWorkspace.shared.frontmostApplication,
+		      frontApp.bundleIdentifier != Bundle.main.bundleIdentifier else {
+			return nil
+		}
+		// Get the frontmost app's main window position via Accessibility API
+		let pid = frontApp.processIdentifier
+		let appRef = AXUIElementCreateApplication(pid)
+		var windowValue: AnyObject?
+		guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &windowValue) == .success else {
+			return nil
+		}
+		let windowRef = windowValue as! AXUIElement
+		var positionValue: AnyObject?
+		guard AXUIElementCopyAttributeValue(windowRef, kAXPositionAttribute as CFString, &positionValue) == .success else {
+			return nil
+		}
+		var point = CGPoint.zero
+		AXValueGetValue(positionValue as! AXValue, .cgPoint, &point)
+		// Find which screen contains this point
+		return NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) }
+	}
+
+	private static func defaultPanelOrigin(on screen: NSScreen) -> NSPoint {
+		let panelWidth: CGFloat = 320
+		let x = screen.visibleFrame.midX - panelWidth / 2
+		let y = screen.visibleFrame.minY + 80
+		return NSPoint(x: x, y: y)
+	}
+
+	private func repositionPanel(_ panel: NSPanel, on screen: NSScreen) {
+		let defaultPos = Self.defaultPanelOrigin(on: screen)
+		let displayKey = String(screen.displayID)
+		if let offset = hexSettings.continuousListeningPanelOffsets[displayKey], offset.count == 2 {
+			panel.setFrameOrigin(NSPoint(x: defaultPos.x + offset[0], y: defaultPos.y + offset[1]))
+		} else {
+			panel.setFrameOrigin(defaultPos)
+		}
 	}
 
 	@objc private func handleAppModeUpdate() {
@@ -174,5 +263,11 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 		Task {
 			await recording.cleanup()
 		}
+	}
+}
+
+private extension NSScreen {
+	var displayID: CGDirectDisplayID {
+		(deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) ?? 0
 	}
 }

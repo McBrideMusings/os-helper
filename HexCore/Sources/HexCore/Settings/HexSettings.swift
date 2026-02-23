@@ -6,6 +6,12 @@ public enum RecordingAudioBehavior: String, Codable, CaseIterable, Equatable, Se
 	case doNothing
 }
 
+public enum MouseButtonAction: String, Codable, CaseIterable, Equatable, Sendable {
+	case none
+	case sendText
+	case clearText
+}
+
 /// User-configurable settings saved to disk.
 public struct HexSettings: Codable, Equatable, Sendable {
 	public static let defaultPasteLastTranscriptHotkey = HotKey(key: .v, modifiers: [.option, .shift])
@@ -45,6 +51,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var wordRemovalsEnabled: Bool
 	public var wordRemovals: [WordRemoval]
 	public var wordRemappings: [WordRemapping]
+	public var mouseButton3Action: MouseButtonAction
+	public var mouseButton4Action: MouseButtonAction
+	public var continuousListeningPanelOffsets: [String: [CGFloat]]
 
 	public init(
 		soundEffectsEnabled: Bool = true,
@@ -68,7 +77,10 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		hasCompletedStorageMigration: Bool = false,
 		wordRemovalsEnabled: Bool = false,
 		wordRemovals: [WordRemoval] = HexSettings.defaultWordRemovals,
-		wordRemappings: [WordRemapping] = []
+		wordRemappings: [WordRemapping] = [],
+		mouseButton3Action: MouseButtonAction = .clearText,
+		mouseButton4Action: MouseButtonAction = .sendText,
+		continuousListeningPanelOffsets: [String: [CGFloat]] = [:]
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
 		self.soundEffectsVolume = soundEffectsVolume
@@ -92,6 +104,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.wordRemovalsEnabled = wordRemovalsEnabled
 		self.wordRemovals = wordRemovals
 		self.wordRemappings = wordRemappings
+		self.mouseButton3Action = mouseButton3Action
+		self.mouseButton4Action = mouseButton4Action
+		self.continuousListeningPanelOffsets = continuousListeningPanelOffsets
 	}
 
 	public init(from decoder: Decoder) throws {
@@ -136,6 +151,9 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case wordRemovalsEnabled
 	case wordRemovals
 	case wordRemappings
+	case mouseButton3Action
+	case mouseButton4Action
+	case continuousListeningPanelOffsets
 }
 
 private struct SettingsField<Value: Codable & Sendable> {
@@ -266,6 +284,9 @@ private enum HexSettingsSchema {
 			.wordRemappings,
 			keyPath: \.wordRemappings,
 			default: defaults.wordRemappings
-		).eraseToAny()
+		).eraseToAny(),
+		SettingsField(.mouseButton3Action, keyPath: \.mouseButton3Action, default: defaults.mouseButton3Action).eraseToAny(),
+		SettingsField(.mouseButton4Action, keyPath: \.mouseButton4Action, default: defaults.mouseButton4Action).eraseToAny(),
+		SettingsField(.continuousListeningPanelOffsets, keyPath: \.continuousListeningPanelOffsets, default: defaults.continuousListeningPanelOffsets).eraseToAny(),
 	]
 }
