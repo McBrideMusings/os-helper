@@ -12,33 +12,62 @@ import WhisperKit
 
 private let logger = HexLog.continuousListening
 
+// MARK: - Text Block Model
+
+struct TextBlock: Equatable, Identifiable {
+  let id: UUID
+  var text: String
+  var status: Status
+  let timestamp: Date
+
+  enum Status: Equatable {
+    case transcribing
+    case complete
+    case error(String)
+  }
+}
+
 @Reducer
 struct ContinuousListeningFeature {
   @ObservableState
   struct State {
     var isActive: Bool = false
-    var accumulatedText: String = ""
-    var isTranscribingChunk: Bool = false
+    var textBlocks: IdentifiedArrayOf<TextBlock> = []
+    var meterLevel: Float = 0
     var sourceAppBundleID: String?
     var sourceAppName: String?
     var error: String?
     @Shared(.isContinuousListeningActive) var isContinuousListeningActive: Bool = false
+
+    // Computed properties for backward compatibility with the panel UI
+    var accumulatedText: String {
+      textBlocks
+        .filter { $0.status == .complete }
+        .map(\.text)
+        .joined(separator: "\n")
+    }
+
+    var isTranscribingChunk: Bool {
+      textBlocks.contains { $0.status == .transcribing }
+    }
   }
 
   enum Action {
     case toggleMode
     case startListening
     case stopListening
-    case chunkTimerFired
-    case chunkTranscriptionResult(String)
-    case chunkTranscriptionError(Error)
+    case meterLevelUpdated(Float)
+    case audioChunkReceived([AVAudioPCMBuffer])
+    case chunkTranscriptionResult(id: UUID, text: String)
+    case chunkTranscriptionError(id: UUID, error: Error)
     case dispatchText
     case textDispatched
   }
 
   private enum CancelID {
-    case chunkTimer
     case listening
+    case meterObservation
+    case chunkObservation
   }
 
   @Dependency(\.streamingAudio) var streamingAudio
@@ -67,9 +96,9 @@ struct ContinuousListeningFeature {
       case .startListening:
         state.isActive = true
         state.$isContinuousListeningActive.withLock { $0 = true }
-        state.accumulatedText = ""
+        state.textBlocks = []
+        state.meterLevel = 0
         state.error = nil
-        state.isTranscribingChunk = false
 
         return .merge(
           // Start audio capture
@@ -79,31 +108,39 @@ struct ContinuousListeningFeature {
               logger.notice("Continuous audio capture started")
             } catch {
               logger.error("Failed to start capture: \(error.localizedDescription)")
-              await send(.chunkTranscriptionError(error))
+              // Use a placeholder ID for capture-level errors
+              await send(.chunkTranscriptionError(id: UUID(), error: error))
             }
           },
-          // Start 5s repeating timer
+          // Observe meter levels
           .run { send in
-            while !Task.isCancelled {
-              try await Task.sleep(for: .seconds(5))
-              await send(.chunkTimerFired)
+            for await level in streamingAudio.observeMeterLevels() {
+              await send(.meterLevelUpdated(level))
             }
           }
-          .cancellable(id: CancelID.chunkTimer)
+          .cancellable(id: CancelID.meterObservation),
+          // Observe VAD-triggered audio chunks
+          .run { send in
+            for await chunk in streamingAudio.observeAudioChunks() {
+              await send(.audioChunkReceived(chunk))
+            }
+          }
+          .cancellable(id: CancelID.chunkObservation)
         )
         .cancellable(id: CancelID.listening)
 
       case .stopListening:
         state.isActive = false
         state.$isContinuousListeningActive.withLock { $0 = false }
-        state.accumulatedText = ""
-        state.isTranscribingChunk = false
+        state.textBlocks = []
+        state.meterLevel = 0
         state.sourceAppBundleID = nil
         state.sourceAppName = nil
         state.error = nil
 
         return .merge(
-          .cancel(id: CancelID.chunkTimer),
+          .cancel(id: CancelID.meterObservation),
+          .cancel(id: CancelID.chunkObservation),
           .cancel(id: CancelID.listening),
           .run { _ in
             await streamingAudio.stopCapture()
@@ -111,31 +148,37 @@ struct ContinuousListeningFeature {
           }
         )
 
-      case .chunkTimerFired:
-        guard state.isActive, !state.isTranscribingChunk else {
-          if state.isTranscribingChunk {
-            logger.debug("Skipping chunk — previous transcription still in progress")
-          }
-          return .none
-        }
+      case let .meterLevelUpdated(level):
+        state.meterLevel = level
+        return .none
 
-        state.isTranscribingChunk = true
+      case let .audioChunkReceived(buffers):
+        guard state.isActive, !buffers.isEmpty else { return .none }
+
+        let blockID = UUID()
+        let block = TextBlock(
+          id: blockID,
+          text: "",
+          status: .transcribing,
+          timestamp: Date()
+        )
+        state.textBlocks.append(block)
+
+        // Capture settings values before the closure to avoid capturing self
         let model = hexSettings.selectedModel
+        let wordRemovalsEnabled = hexSettings.wordRemovalsEnabled
+        let wordRemovals = hexSettings.wordRemovals
+        let wordRemappings = hexSettings.wordRemappings
 
         return .run { send in
-          let buffers = await streamingAudio.flushBuffers()
-          guard !buffers.isEmpty else {
-            logger.debug("No audio buffers to transcribe")
-            await send(.chunkTranscriptionResult(""))
-            return
-          }
-
           let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("hex-continuous-\(UUID().uuidString).wav")
+            .appendingPathComponent("hex-continuous-\(blockID.uuidString).wav")
 
           do {
             try AudioBufferWriter.writeWAV(buffers: buffers, to: tempURL)
-            logger.notice("Wrote \(buffers.count) buffer(s) to \(tempURL.lastPathComponent, privacy: .public)")
+            logger.notice(
+              "Wrote \(buffers.count) buffer(s) to \(tempURL.lastPathComponent, privacy: .public)"
+            )
 
             let decodeOptions = DecodingOptions(
               language: nil,
@@ -145,50 +188,51 @@ struct ContinuousListeningFeature {
             let result = try await transcription.transcribe(tempURL, model, decodeOptions) { _ in }
             try? FileManager.default.removeItem(at: tempURL)
 
-            await send(.chunkTranscriptionResult(result))
+            // Apply word removals and remappings
+            var output = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            if wordRemovalsEnabled {
+              output = WordRemovalApplier.apply(output, removals: wordRemovals)
+            }
+            output = WordRemappingApplier.apply(output, remappings: wordRemappings)
+
+            await send(.chunkTranscriptionResult(id: blockID, text: output))
           } catch {
             try? FileManager.default.removeItem(at: tempURL)
             logger.error("Chunk transcription failed: \(error.localizedDescription)")
-            await send(.chunkTranscriptionError(error))
+            await send(.chunkTranscriptionError(id: blockID, error: error))
           }
         }
 
-      case let .chunkTranscriptionResult(text):
-        state.isTranscribingChunk = false
-
+      case let .chunkTranscriptionResult(id, text):
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return .none }
-
-        // Apply word removals and remappings
-        var output = trimmed
-        if hexSettings.wordRemovalsEnabled {
-          output = WordRemovalApplier.apply(output, removals: hexSettings.wordRemovals)
-        }
-        output = WordRemappingApplier.apply(output, remappings: hexSettings.wordRemappings)
-
-        guard !output.isEmpty else { return .none }
-
-        if state.accumulatedText.isEmpty {
-          state.accumulatedText = output
+        if trimmed.isEmpty {
+          // Remove empty blocks
+          state.textBlocks.remove(id: id)
         } else {
-          state.accumulatedText += " " + output
+          state.textBlocks[id: id]?.text = trimmed
+          state.textBlocks[id: id]?.status = .complete
         }
 
-        let textLength = state.accumulatedText.count
-        logger.notice("Accumulated text length: \(textLength)")
+        let totalChars = state.textBlocks.filter { $0.status == .complete }.reduce(0) { $0 + $1.text.count }
+        logger.notice("Accumulated text length: \(totalChars)")
         return .none
 
-      case let .chunkTranscriptionError(error):
-        state.isTranscribingChunk = false
+      case let .chunkTranscriptionError(id, error):
+        state.textBlocks[id: id]?.status = .error(error.localizedDescription)
         state.error = error.localizedDescription
         logger.error("Transcription error: \(error.localizedDescription)")
         return .none
 
       case .dispatchText:
-        let text = state.accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = state.textBlocks
+          .filter { $0.status == .complete }
+          .map(\.text)
+          .joined(separator: "\n")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .none }
 
-        state.accumulatedText = ""
+        // Clear completed blocks
+        state.textBlocks = state.textBlocks.filter { $0.status == .transcribing }
         logger.notice("Dispatching \(text.count) characters to target app")
 
         return .run { send in

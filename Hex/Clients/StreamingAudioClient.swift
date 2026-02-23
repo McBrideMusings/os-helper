@@ -18,6 +18,8 @@ struct StreamingAudioClient {
   var startCapture: @Sendable () async throws -> Void
   var stopCapture: @Sendable () async -> Void
   var flushBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
+  var observeMeterLevels: @Sendable () -> AsyncStream<Float> = { .finished }
+  var observeAudioChunks: @Sendable () -> AsyncStream<[AVAudioPCMBuffer]> = { .finished }
 }
 
 extension StreamingAudioClient: DependencyKey {
@@ -26,7 +28,9 @@ extension StreamingAudioClient: DependencyKey {
     return Self(
       startCapture: { try await live.startCapture() },
       stopCapture: { await live.stopCapture() },
-      flushBuffers: { await live.flushBuffers() }
+      flushBuffers: { await live.flushBuffers() },
+      observeMeterLevels: { live.startMeterStream() },
+      observeAudioChunks: { live.startChunkStream() }
     )
   }
 }
@@ -46,6 +50,82 @@ private actor StreamingAudioClientLive {
   private let targetSampleRate: Double = 16000
   private let targetChannels: AVAudioChannelCount = 1
 
+  // Meter stream
+  private var meterContinuation: AsyncStream<Float>.Continuation?
+
+  // VAD-triggered chunk stream
+  private var chunkContinuation: AsyncStream<[AVAudioPCMBuffer]>.Continuation?
+  private let silenceThreshold: Float = 0.01
+  private let silenceDuration: TimeInterval = 0.4
+  private var isVoiceActive: Bool = false
+  private var silenceStart: Date?
+
+  // MARK: - Stream factories (nonisolated for sync access)
+
+  nonisolated func startMeterStream() -> AsyncStream<Float> {
+    AsyncStream<Float> { continuation in
+      Task { await self.setMeterContinuation(continuation) }
+    }
+  }
+
+  nonisolated func startChunkStream() -> AsyncStream<[AVAudioPCMBuffer]> {
+    AsyncStream<[AVAudioPCMBuffer]> { continuation in
+      Task { await self.setChunkContinuation(continuation) }
+    }
+  }
+
+  private func setMeterContinuation(_ continuation: AsyncStream<Float>.Continuation) {
+    meterContinuation = continuation
+  }
+
+  private func setChunkContinuation(_ continuation: AsyncStream<[AVAudioPCMBuffer]>.Continuation) {
+    chunkContinuation = continuation
+  }
+
+  // MARK: - RMS
+
+  static func computeRMS(buffer: AVAudioPCMBuffer) -> Float {
+    guard let channelData = buffer.floatChannelData else { return 0 }
+    let frames = Int(buffer.frameLength)
+    guard frames > 0 else { return 0 }
+    let samples = channelData[0]
+    var sumOfSquares: Float = 0
+    for i in 0..<frames {
+      let sample = samples[i]
+      sumOfSquares += sample * sample
+    }
+    let rms = sqrtf(sumOfSquares / Float(frames))
+    return min(rms * 3.0, 1.0)
+  }
+
+  // MARK: - Meter & VAD
+
+  private func emitMeterLevel(_ level: Float) {
+    meterContinuation?.yield(level)
+  }
+
+  private func processVAD(level: Float) {
+    if level >= silenceThreshold {
+      isVoiceActive = true
+      silenceStart = nil
+    } else if isVoiceActive {
+      if silenceStart == nil {
+        silenceStart = Date()
+      }
+      if let start = silenceStart, Date().timeIntervalSince(start) >= silenceDuration {
+        // Silence exceeded threshold — flush chunk
+        if !buffers.isEmpty {
+          chunkContinuation?.yield(buffers)
+          buffers.removeAll()
+        }
+        isVoiceActive = false
+        silenceStart = nil
+      }
+    }
+  }
+
+  // MARK: - Capture
+
   func startCapture() throws {
     let engine = AVAudioEngine()
     let inputNode = engine.inputNode
@@ -63,7 +143,12 @@ private actor StreamingAudioClientLive {
     inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: hardwareFormat) {
       [weak self] buffer, _ in
       guard let self else { return }
-      Task { await self.appendBuffer(buffer) }
+      let level = Self.computeRMS(buffer: buffer)
+      Task {
+        await self.appendBuffer(buffer)
+        await self.emitMeterLevel(level)
+        await self.processVAD(level: level)
+      }
     }
 
     try engine.start()
@@ -76,7 +161,20 @@ private actor StreamingAudioClientLive {
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
     self.engine = nil
+
+    // Flush any remaining buffers as a final chunk
+    if !buffers.isEmpty {
+      chunkContinuation?.yield(buffers)
+    }
     buffers.removeAll()
+
+    meterContinuation?.finish()
+    meterContinuation = nil
+    chunkContinuation?.finish()
+    chunkContinuation = nil
+    isVoiceActive = false
+    silenceStart = nil
+
     logger.notice("Audio capture stopped")
   }
 
