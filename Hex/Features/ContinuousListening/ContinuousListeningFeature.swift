@@ -12,6 +12,25 @@ import WhisperKit
 
 private let logger = HexLog.continuousListening
 
+// MARK: - Audio Buffer Writer
+
+/// Writes an array of AVAudioPCMBuffers to a temporary WAV file for file-based transcription.
+enum AudioBufferWriter {
+  static func write(buffers: [AVAudioPCMBuffer]) throws -> URL {
+    guard let first = buffers.first else {
+      throw NSError(domain: "AudioBufferWriter", code: -1, userInfo: [NSLocalizedDescriptionKey: "No buffers to write"])
+    }
+    let format = first.format
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("hex-chunk-\(UUID().uuidString).wav")
+    let file = try AVAudioFile(forWriting: url, settings: format.settings)
+    for buffer in buffers {
+      try file.write(from: buffer)
+    }
+    return url
+  }
+}
+
 // MARK: - Text Block Model
 
 struct TextBlock: Equatable, Identifiable {
@@ -47,13 +66,18 @@ struct ContinuousListeningFeature {
     case startListening
     case stopListening
     case meterLevelUpdated(Float)
-    case audioChunkReceived([AVAudioPCMBuffer])
-    case chunkTranscriptionResult(id: UUID, text: String)
-    case chunkTranscriptionError(id: UUID, error: Error)
-    case captureError(String)
-    case retryCapture
+    // Streaming mode
+    case streamingUpdate(StreamingTextUpdate)
+    case streamingError(String)
+    // Chunked mode
+    case chunkReceived([AVAudioPCMBuffer])
+    case chunkTranscribed(UUID, String)
+    case chunkFailed(UUID, String)
     case interimTimerFired
     case interimTranscriptionResult(String)
+    // Common
+    case captureError(String)
+    case retryCapture
     case dispatchText
     case clearText
     case textDispatched
@@ -62,6 +86,8 @@ struct ContinuousListeningFeature {
   private enum CancelID {
     case listening
     case meterObservation
+    case rawBufferForwarding
+    case streamingUpdates
     case chunkObservation
     case interimTimer
     case interimTranscription
@@ -70,6 +96,7 @@ struct ContinuousListeningFeature {
   }
 
   @Dependency(\.streamingAudio) var streamingAudio
+  @Dependency(\.streamingTranscription) var streamingTranscription
   @Dependency(\.transcription) var transcription
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.soundEffects) var soundEffects
@@ -99,6 +126,14 @@ struct ContinuousListeningFeature {
         state.textBlocks = []
         state.meterLevel = 0
         state.error = nil
+        state.interimText = nil
+
+        let model = hexSettings.selectedModel
+        let backend = hexSettings.continuousListeningBackend
+        let threshold = hexSettings.streamingConfirmationThreshold
+        let minContext = hexSettings.streamingMinConfirmationContext
+
+        logger.notice("Starting continuous listening backend=\(backend.rawValue, privacy: .public) model=\(model, privacy: .public)")
 
         return .merge(
           // Start audio capture
@@ -109,6 +144,17 @@ struct ContinuousListeningFeature {
             } catch {
               logger.error("Failed to start capture: \(error.localizedDescription)")
               await send(.captureError(error.localizedDescription))
+              return
+            }
+
+            if backend == .streaming {
+              do {
+                try await streamingTranscription.startStreaming(model, threshold, minContext)
+                logger.notice("Streaming transcription started (threshold=\(threshold), minContext=\(minContext))")
+              } catch {
+                logger.error("Failed to start streaming transcription: \(error.localizedDescription)")
+                await send(.streamingError(error.localizedDescription))
+              }
             }
           },
           // Observe meter levels
@@ -118,21 +164,8 @@ struct ContinuousListeningFeature {
             }
           }
           .cancellable(id: CancelID.meterObservation),
-          // Observe VAD-triggered audio chunks
-          .run { send in
-            for await chunk in streamingAudio.observeAudioChunks() {
-              await send(.audioChunkReceived(chunk))
-            }
-          }
-          .cancellable(id: CancelID.chunkObservation),
-          // Interim transcription timer — peek at buffers every 2s for live preview
-          .run { send in
-            while !Task.isCancelled {
-              try await Task.sleep(for: .seconds(2))
-              await send(.interimTimerFired)
-            }
-          }
-          .cancellable(id: CancelID.interimTimer),
+          // Backend-specific effects
+          backendEffects(backend: backend, model: model, threshold: threshold, minContext: minContext),
           // Watchdog — if no meter data arrives within 3s, the hardware IO likely failed
           .run { send in
             try await Task.sleep(for: .seconds(3))
@@ -155,6 +188,8 @@ struct ContinuousListeningFeature {
 
         return .merge(
           .cancel(id: CancelID.meterObservation),
+          .cancel(id: CancelID.rawBufferForwarding),
+          .cancel(id: CancelID.streamingUpdates),
           .cancel(id: CancelID.chunkObservation),
           .cancel(id: CancelID.interimTimer),
           .cancel(id: CancelID.interimTranscription),
@@ -162,6 +197,7 @@ struct ContinuousListeningFeature {
           .cancel(id: CancelID.recovery),
           .cancel(id: CancelID.listening),
           .run { _ in
+            await streamingTranscription.cancel()
             await streamingAudio.stopCapture()
             logger.notice("Continuous listening stopped")
           }
@@ -180,43 +216,39 @@ struct ContinuousListeningFeature {
           .cancel(id: CancelID.recovery)
         )
 
-      case .interimTimerFired:
-        guard state.isActive else { return .none }
-        let model = hexSettings.selectedModel
+      // MARK: - Streaming Mode Updates
 
-        return .run { send in
-          let buffers = await streamingAudio.peekBuffers()
-          guard !buffers.isEmpty else { return }
+      case let .streamingUpdate(update):
+        let trimmed = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .none }
 
-          let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("hex-interim-\(UUID().uuidString).wav")
+        var output = applyTextProcessing(trimmed)
 
-          do {
-            try AudioBufferWriter.writeWAV(buffers: buffers, to: tempURL)
-            let decodeOptions = DecodingOptions(
-              language: nil,
-              detectLanguage: true,
-              chunkingStrategy: .vad
-            )
-            let result = try await transcription.transcribe(tempURL, model, decodeOptions) { _ in }
-            try? FileManager.default.removeItem(at: tempURL)
-            await send(.interimTranscriptionResult(result))
-          } catch {
-            try? FileManager.default.removeItem(at: tempURL)
-          }
+        if update.isConfirmed {
+          let block = TextBlock(
+            id: UUID(),
+            text: output,
+            status: .complete,
+            timestamp: Date()
+          )
+          state.textBlocks.append(block)
+          state.interimText = nil
+
+          let totalChars = state.textBlocks.filter { $0.status == .complete }.reduce(0) { $0 + $1.text.count }
+          logger.notice("Confirmed text (\(totalChars) total chars): \(output, privacy: .private)")
+        } else {
+          state.interimText = output
         }
-        .cancellable(id: CancelID.interimTranscription, cancelInFlight: true)
-
-      case let .interimTranscriptionResult(text):
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        state.interimText = trimmed.isEmpty ? nil : trimmed
         return .none
 
-      case let .audioChunkReceived(buffers):
-        // Real chunk arrived — clear interim text and cancel any in-flight interim transcription
-        state.interimText = nil
-        guard state.isActive, !buffers.isEmpty else { return .none }
+      case let .streamingError(message):
+        state.error = message
+        logger.error("Streaming transcription error: \(message)")
+        return .none
 
+      // MARK: - Chunked Mode Updates
+
+      case let .chunkReceived(buffers):
         let blockID = UUID()
         let block = TextBlock(
           id: blockID,
@@ -225,79 +257,97 @@ struct ContinuousListeningFeature {
           timestamp: Date()
         )
         state.textBlocks.append(block)
+        state.interimText = nil
 
-        // Capture settings values before the closure to avoid capturing self
         let model = hexSettings.selectedModel
-        let wordRemovalsEnabled = hexSettings.wordRemovalsEnabled
-        let wordRemovals = hexSettings.wordRemovals
-        let wordRemappings = hexSettings.wordRemappings
+        let language = hexSettings.outputLanguage
 
         return .run { send in
-          let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("hex-continuous-\(blockID.uuidString).wav")
-
           do {
-            try AudioBufferWriter.writeWAV(buffers: buffers, to: tempURL)
-            logger.notice(
-              "Wrote \(buffers.count) buffer(s) to \(tempURL.lastPathComponent, privacy: .public)"
-            )
+            let url = try AudioBufferWriter.write(buffers: buffers)
+            defer { try? FileManager.default.removeItem(at: url) }
 
             let decodeOptions = DecodingOptions(
-              language: nil,
-              detectLanguage: true,
+              language: language,
+              detectLanguage: language == nil,
               chunkingStrategy: .vad
             )
-            let result = try await transcription.transcribe(tempURL, model, decodeOptions) { _ in }
-            try? FileManager.default.removeItem(at: tempURL)
-
-            // Apply word removals and remappings
-            var output = result.trimmingCharacters(in: .whitespacesAndNewlines)
-            if wordRemovalsEnabled {
-              output = WordRemovalApplier.apply(output, removals: wordRemovals)
-            }
-            output = WordRemappingApplier.apply(output, remappings: wordRemappings)
-
-            await send(.chunkTranscriptionResult(id: blockID, text: output))
+            let text = try await transcription.transcribe(url, model, decodeOptions) { _ in }
+            await send(.chunkTranscribed(blockID, text))
           } catch {
-            try? FileManager.default.removeItem(at: tempURL)
-            logger.error("Chunk transcription failed: \(error.localizedDescription)")
-            await send(.chunkTranscriptionError(id: blockID, error: error))
+            await send(.chunkFailed(blockID, error.localizedDescription))
           }
         }
 
-      case let .chunkTranscriptionResult(id, text):
+      case let .chunkTranscribed(blockID, text):
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-          // Remove empty blocks
-          state.textBlocks.remove(id: id)
-        } else {
-          state.textBlocks[id: id]?.text = trimmed
-          state.textBlocks[id: id]?.status = .complete
+        guard !trimmed.isEmpty else {
+          state.textBlocks.remove(id: blockID)
+          return .none
         }
 
+        let output = applyTextProcessing(trimmed)
+        state.textBlocks[id: blockID]?.text = output
+        state.textBlocks[id: blockID]?.status = .complete
+
         let totalChars = state.textBlocks.filter { $0.status == .complete }.reduce(0) { $0 + $1.text.count }
-        logger.notice("Accumulated text length: \(totalChars)")
+        logger.notice("Chunk transcribed (\(totalChars) total chars): \(output, privacy: .private)")
         return .none
 
-      case let .chunkTranscriptionError(id, error):
-        state.textBlocks[id: id]?.status = .error(error.localizedDescription)
-        state.error = error.localizedDescription
-        logger.error("Transcription error: \(error.localizedDescription)")
+      case let .chunkFailed(blockID, message):
+        state.textBlocks[id: blockID]?.status = .error(message)
+        logger.error("Chunk transcription failed: \(message)")
         return .none
+
+      case .interimTimerFired:
+        let model = hexSettings.selectedModel
+        let language = hexSettings.outputLanguage
+
+        return .run { [streamingAudio] send in
+          let buffers = await streamingAudio.peekBuffers()
+          guard !buffers.isEmpty else { return }
+          do {
+            let url = try AudioBufferWriter.write(buffers: buffers)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let decodeOptions = DecodingOptions(
+              language: language,
+              detectLanguage: language == nil,
+              chunkingStrategy: .vad
+            )
+            let text = try await transcription.transcribe(url, model, decodeOptions) { _ in }
+            await send(.interimTranscriptionResult(text))
+          } catch {
+            logger.debug("Interim transcription failed: \(error.localizedDescription)")
+          }
+        }
+        .cancellable(id: CancelID.interimTranscription, cancelInFlight: true)
+
+      case let .interimTranscriptionResult(text):
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+          state.interimText = nil
+        } else {
+          state.interimText = applyTextProcessing(trimmed)
+        }
+        return .none
+
+      // MARK: - Common
 
       case let .captureError(message):
         state.hasCaptureError = true
         state.error = message
         state.meterLevel = 0
         logger.error("Capture error: \(message)")
-        // Stop streams and schedule auto-retry in 5 seconds
         return .merge(
           .cancel(id: CancelID.meterObservation),
+          .cancel(id: CancelID.rawBufferForwarding),
+          .cancel(id: CancelID.streamingUpdates),
           .cancel(id: CancelID.chunkObservation),
           .cancel(id: CancelID.interimTimer),
           .cancel(id: CancelID.interimTranscription),
           .cancel(id: CancelID.watchdog),
           .run { _ in
+            await streamingTranscription.cancel()
             await streamingAudio.stopCapture()
           },
           .run { send in
@@ -313,6 +363,11 @@ struct ContinuousListeningFeature {
         state.hasCaptureError = false
         state.error = nil
 
+        let model = hexSettings.selectedModel
+        let backend = hexSettings.continuousListeningBackend
+        let threshold = hexSettings.streamingConfirmationThreshold
+        let minContext = hexSettings.streamingMinConfirmationContext
+
         return .merge(
           // Restart audio capture
           .run { send in
@@ -322,6 +377,17 @@ struct ContinuousListeningFeature {
             } catch {
               logger.error("Capture retry failed: \(error.localizedDescription)")
               await send(.captureError(error.localizedDescription))
+              return
+            }
+
+            if backend == .streaming {
+              do {
+                try await streamingTranscription.startStreaming(model, threshold, minContext)
+                logger.notice("Streaming transcription retry succeeded")
+              } catch {
+                logger.error("Streaming transcription retry failed: \(error.localizedDescription)")
+                await send(.streamingError(error.localizedDescription))
+              }
             }
           },
           // Re-observe meter levels
@@ -331,22 +397,9 @@ struct ContinuousListeningFeature {
             }
           }
           .cancellable(id: CancelID.meterObservation),
-          // Re-observe audio chunks
-          .run { send in
-            for await chunk in streamingAudio.observeAudioChunks() {
-              await send(.audioChunkReceived(chunk))
-            }
-          }
-          .cancellable(id: CancelID.chunkObservation),
-          // Restart interim timer
-          .run { send in
-            while !Task.isCancelled {
-              try await Task.sleep(for: .seconds(2))
-              await send(.interimTimerFired)
-            }
-          }
-          .cancellable(id: CancelID.interimTimer),
-          // New watchdog for this attempt
+          // Backend-specific effects
+          backendEffects(backend: backend, model: model, threshold: threshold, minContext: minContext),
+          // New watchdog
           .run { send in
             try await Task.sleep(for: .seconds(3))
             await send(.captureError("No audio data received — microphone may be in use by another app"))
@@ -357,6 +410,7 @@ struct ContinuousListeningFeature {
       case .clearText:
         let blockCount = state.textBlocks.count
         state.textBlocks = []
+        state.interimText = nil
         state.error = nil
         logger.notice("Cleared \(blockCount) text blocks")
         return .none
@@ -370,7 +424,7 @@ struct ContinuousListeningFeature {
         guard !text.isEmpty else { return .none }
 
         // Clear completed blocks
-        state.textBlocks = state.textBlocks.filter { $0.status == .transcribing }
+        state.textBlocks = state.textBlocks.filter { $0.status != .complete }
         logger.notice("Dispatching \(text.count) characters to target app")
 
         return .run { send in
@@ -385,86 +439,61 @@ struct ContinuousListeningFeature {
       }
     }
   }
-}
 
-// MARK: - Audio Buffer WAV Writer
+  // MARK: - Helpers
 
-enum AudioBufferWriter {
-  /// Writes an array of AVAudioPCMBuffers to a 16kHz mono WAV file.
-  static func writeWAV(buffers: [AVAudioPCMBuffer], to url: URL) throws {
-    guard let firstBuffer = buffers.first else {
-      throw AudioBufferWriterError.noBuffers
+  private func applyTextProcessing(_ text: String) -> String {
+    var output = text
+    if hexSettings.wordRemovalsEnabled {
+      output = WordRemovalApplier.apply(output, removals: hexSettings.wordRemovals)
     }
-
-    let sourceFormat = firstBuffer.format
-    let targetFormat = AVAudioFormat(
-      commonFormat: .pcmFormatFloat32,
-      sampleRate: 16000,
-      channels: 1,
-      interleaved: false
-    )!
-
-    let needsConversion = sourceFormat.sampleRate != 16000 || sourceFormat.channelCount != 1
-
-    guard let outputFile = try? AVAudioFile(
-      forWriting: url,
-      settings: targetFormat.settings,
-      commonFormat: .pcmFormatFloat32,
-      interleaved: false
-    ) else {
-      throw AudioBufferWriterError.cannotCreateFile
-    }
-
-    if needsConversion {
-      guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
-        throw AudioBufferWriterError.cannotCreateConverter
-      }
-
-      for buffer in buffers {
-        let ratio = 16000.0 / sourceFormat.sampleRate
-        let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
-        guard let outputBuffer = AVAudioPCMBuffer(
-          pcmFormat: targetFormat,
-          frameCapacity: outputFrameCount
-        ) else { continue }
-
-        var error: NSError?
-        var consumed = false
-        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-          if consumed {
-            outStatus.pointee = .noDataNow
-            return nil
-          }
-          consumed = true
-          outStatus.pointee = .haveData
-          return buffer
-        }
-
-        if let error {
-          logger.error("Conversion error: \(error.localizedDescription)")
-          continue
-        }
-
-        try outputFile.write(from: outputBuffer)
-      }
-    } else {
-      for buffer in buffers {
-        try outputFile.write(from: buffer)
-      }
-    }
+    output = WordRemappingApplier.apply(output, remappings: hexSettings.wordRemappings)
+    return output
   }
 
-  enum AudioBufferWriterError: Error, LocalizedError {
-    case noBuffers
-    case cannotCreateFile
-    case cannotCreateConverter
+  private func backendEffects(
+    backend: ContinuousListeningBackend,
+    model: String,
+    threshold: Double,
+    minContext: Double
+  ) -> Effect<Action> {
+    switch backend {
+    case .streaming:
+      return .merge(
+        // Forward raw audio buffers to streaming transcription
+        .run { _ in
+          for await buffer in streamingAudio.observeRawBuffers() {
+            await streamingTranscription.streamAudio(buffer)
+          }
+        }
+        .cancellable(id: CancelID.rawBufferForwarding),
+        // Observe streaming transcription updates
+        .run { send in
+          for await update in streamingTranscription.observeUpdates() {
+            await send(.streamingUpdate(update))
+          }
+        }
+        .cancellable(id: CancelID.streamingUpdates)
+      )
 
-    var errorDescription: String? {
-      switch self {
-      case .noBuffers: "No audio buffers to write"
-      case .cannotCreateFile: "Cannot create output WAV file"
-      case .cannotCreateConverter: "Cannot create audio format converter"
-      }
+    case .chunked:
+      return .merge(
+        // Observe VAD-triggered audio chunks
+        .run { send in
+          for await buffers in streamingAudio.observeAudioChunks() {
+            await send(.chunkReceived(buffers))
+          }
+        }
+        .cancellable(id: CancelID.chunkObservation),
+        // Interim timer — periodically transcribe accumulated buffers for gray preview text
+        .run { send in
+          while true {
+            try await Task.sleep(for: .seconds(1.5))
+            await send(.interimTimerFired)
+          }
+        }
+        .cancellable(id: CancelID.interimTimer)
+      )
     }
   }
 }

@@ -6,6 +6,7 @@
 //
 
 import AVFoundation
+import ComposableArchitecture
 import Dependencies
 import DependenciesMacros
 import Foundation
@@ -101,7 +102,8 @@ actor TranscriptionClientLive {
   func downloadAndLoadModel(variant: String, progressCallback: @escaping (Progress) -> Void) async throws {
     // If Parakeet, use Parakeet client path
     if isParakeet(variant) {
-      try await parakeet.ensureLoaded(modelName: variant, progress: progressCallback)
+      let useGPU = readUseGPUAcceleration()
+      try await parakeet.ensureLoaded(modelName: variant, useGPU: useGPU, progress: progressCallback)
       currentModelName = variant
       return
     }
@@ -306,6 +308,11 @@ actor TranscriptionClientLive {
     }
 
     return ModelPatternMatcher.resolvePattern(variant, from: models) ?? variant
+  }
+
+  private nonisolated func readUseGPUAcceleration() -> Bool {
+    @Shared(.hexSettings) var hexSettings: HexSettings
+    return hexSettings.useGPUAcceleration
   }
 
   private func isParakeet(_ name: String) -> Bool {

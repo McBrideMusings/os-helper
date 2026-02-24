@@ -12,6 +12,11 @@ public enum MouseButtonAction: String, Codable, CaseIterable, Equatable, Sendabl
 	case clearText
 }
 
+public enum ContinuousListeningBackend: String, Codable, CaseIterable, Equatable, Sendable {
+	case streaming
+	case chunked
+}
+
 /// User-configurable settings saved to disk.
 public struct HexSettings: Codable, Equatable, Sendable {
 	public static let defaultPasteLastTranscriptHotkey = HotKey(key: .v, modifiers: [.option, .shift])
@@ -56,6 +61,10 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var doubleDoubleClickToSend: Bool
 	public var doubleRightClickToClear: Bool
 	public var continuousListeningPanelOffsets: [String: [CGFloat]]
+	public var continuousListeningBackend: ContinuousListeningBackend
+	public var streamingConfirmationThreshold: Double
+	public var streamingMinConfirmationContext: Double
+	public var useGPUAcceleration: Bool
 
 	public init(
 		soundEffectsEnabled: Bool = true,
@@ -84,7 +93,11 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		mouseButton4Action: MouseButtonAction = .sendText,
 		doubleDoubleClickToSend: Bool = false,
 		doubleRightClickToClear: Bool = false,
-		continuousListeningPanelOffsets: [String: [CGFloat]] = [:]
+		continuousListeningPanelOffsets: [String: [CGFloat]] = [:],
+		continuousListeningBackend: ContinuousListeningBackend = .chunked,
+		streamingConfirmationThreshold: Double = 0.80,
+		streamingMinConfirmationContext: Double = 3.0,
+		useGPUAcceleration: Bool = false
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
 		self.soundEffectsVolume = soundEffectsVolume
@@ -113,6 +126,10 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.doubleDoubleClickToSend = doubleDoubleClickToSend
 		self.doubleRightClickToClear = doubleRightClickToClear
 		self.continuousListeningPanelOffsets = continuousListeningPanelOffsets
+		self.continuousListeningBackend = continuousListeningBackend
+		self.streamingConfirmationThreshold = streamingConfirmationThreshold
+		self.streamingMinConfirmationContext = streamingMinConfirmationContext
+		self.useGPUAcceleration = useGPUAcceleration
 	}
 
 	public init(from decoder: Decoder) throws {
@@ -162,6 +179,10 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case doubleDoubleClickToSend
 	case doubleRightClickToClear
 	case continuousListeningPanelOffsets
+	case continuousListeningBackend
+	case streamingConfirmationThreshold
+	case streamingMinConfirmationContext
+	case useGPUAcceleration
 }
 
 private struct SettingsField<Value: Codable & Sendable> {
@@ -298,5 +319,9 @@ private enum HexSettingsSchema {
 		SettingsField(.doubleDoubleClickToSend, keyPath: \.doubleDoubleClickToSend, default: defaults.doubleDoubleClickToSend).eraseToAny(),
 		SettingsField(.doubleRightClickToClear, keyPath: \.doubleRightClickToClear, default: defaults.doubleRightClickToClear).eraseToAny(),
 		SettingsField(.continuousListeningPanelOffsets, keyPath: \.continuousListeningPanelOffsets, default: defaults.continuousListeningPanelOffsets).eraseToAny(),
+		SettingsField(.continuousListeningBackend, keyPath: \.continuousListeningBackend, default: defaults.continuousListeningBackend).eraseToAny(),
+		SettingsField(.streamingConfirmationThreshold, keyPath: \.streamingConfirmationThreshold, default: defaults.streamingConfirmationThreshold).eraseToAny(),
+		SettingsField(.streamingMinConfirmationContext, keyPath: \.streamingMinConfirmationContext, default: defaults.streamingMinConfirmationContext).eraseToAny(),
+		SettingsField(.useGPUAcceleration, keyPath: \.useGPUAcceleration, default: defaults.useGPUAcceleration).eraseToAny(),
 	]
 }

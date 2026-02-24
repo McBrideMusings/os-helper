@@ -133,6 +133,70 @@ struct GeneralSectionView: View {
 		} header: {
 			Text("Mouse Buttons (Continuous Dictation)")
 		}
+
+		Section {
+			Label {
+				HStack(alignment: .center) {
+					Text("Engine")
+					Spacer()
+					Picker("", selection: $store.hexSettings.continuousListeningBackend) {
+						Text("Chunked (VAD)").tag(ContinuousListeningBackend.chunked)
+						Text("Streaming").tag(ContinuousListeningBackend.streaming)
+					}
+					.pickerStyle(.menu)
+				}
+			} icon: {
+				Image(systemName: "waveform.badge.mic")
+			}
+
+			Label {
+				Toggle("GPU Acceleration", isOn: $store.hexSettings.useGPUAcceleration)
+				Text("Use GPU for model inference. May improve speed on Apple Silicon. Requires model reload.")
+					.settingsCaption()
+			} icon: {
+				Image(systemName: "cpu")
+			}
+
+			if store.hexSettings.continuousListeningBackend == .streaming {
+				Label {
+					HStack {
+						Text("Confirmation Delay")
+						Spacer()
+						Stepper(
+							"\(store.hexSettings.streamingMinConfirmationContext, specifier: "%.0f")s",
+							value: $store.hexSettings.streamingMinConfirmationContext,
+							in: 1...15,
+							step: 1
+						)
+					}
+				} icon: {
+					Image(systemName: "timer")
+				}
+
+				Label {
+					HStack {
+						Text("Confidence Threshold")
+						Spacer()
+						Text("\(store.hexSettings.streamingConfirmationThreshold, specifier: "%.2f")")
+							.monospacedDigit()
+						Stepper(
+							"",
+							value: $store.hexSettings.streamingConfirmationThreshold,
+							in: 0.50...0.99,
+							step: 0.05
+						)
+						.labelsHidden()
+					}
+				} icon: {
+					Image(systemName: "dial.low")
+				}
+			}
+
+			Text("Chunked mode transcribes after each pause. Streaming mode shows live text but needs more audio context before confirming.")
+				.settingsCaption()
+		} header: {
+			Text("Continuous Dictation Engine")
+		}
 		.enableInjection()
 	}
 }

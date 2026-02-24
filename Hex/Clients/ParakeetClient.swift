@@ -1,3 +1,4 @@
+import CoreML
 import Foundation
 import HexCore
 
@@ -8,6 +9,7 @@ actor ParakeetClient {
   private var asr: AsrManager?
   private var models: AsrModels?
   private var currentVariant: ParakeetModel?
+  private var currentUseGPU: Bool?
   private let logger = HexLog.parakeet
   private let vendorDirs = [
     // Our app-specific cache path convention (under XDG or com.kitlangton.Hex/cache)
@@ -46,7 +48,7 @@ actor ParakeetClient {
     return false
   }
 
-  func ensureLoaded(modelName: String, progress: @escaping (Progress) -> Void) async throws {
+  func ensureLoaded(modelName: String, useGPU: Bool = false, progress: @escaping (Progress) -> Void) async throws {
     guard let variant = ParakeetModel(rawValue: modelName) else {
       throw NSError(
         domain: "Parakeet",
@@ -54,8 +56,9 @@ actor ParakeetClient {
         userInfo: [NSLocalizedDescriptionKey: "Unsupported Parakeet variant: \(modelName)"]
       )
     }
-    if currentVariant == variant, asr != nil { return }
-    if currentVariant != variant {
+    let gpuChanged = currentUseGPU != nil && currentUseGPU != useGPU
+    if currentVariant == variant, asr != nil, !gpuChanged { return }
+    if currentVariant != variant || gpuChanged {
       asr = nil
       models = nil
     }
@@ -84,12 +87,16 @@ actor ParakeetClient {
     defer { pollTask.cancel() }
 
     // Download + load the requested variant (returns when all assets are present)
-    let models = try await AsrModels.downloadAndLoad(version: variant.asrVersion)
+    let mlConfig = MLModelConfiguration()
+    mlConfig.computeUnits = useGPU ? .all : .cpuAndNeuralEngine
+    logger.notice("Loading Parakeet with computeUnits=\(useGPU ? "all (GPU)" : "cpuAndNeuralEngine")")
+    let models = try await AsrModels.downloadAndLoad(configuration: mlConfig, version: variant.asrVersion)
     self.models = models
     let manager = AsrManager(config: .init())
     try await manager.initialize(models: models)
     self.asr = manager
     self.currentVariant = variant
+    self.currentUseGPU = useGPU
     p.completedUnitCount = 100
     progress(p)
     logger.notice("Parakeet ensureLoaded completed in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
@@ -106,6 +113,8 @@ actor ParakeetClient {
     }
     return total
   }
+
+  func getLoadedModels() -> AsrModels? { models }
 
   func transcribe(_ url: URL) async throws -> String {
     guard let asr else { throw NSError(domain: "Parakeet", code: -1, userInfo: [NSLocalizedDescriptionKey: "Parakeet not initialized"]) }
@@ -185,7 +194,7 @@ private extension ParakeetModel {
 
 actor ParakeetClient {
   func isModelAvailable(_ modelName: String) async -> Bool { false }
-  func ensureLoaded(modelName: String, progress: @escaping (Progress) -> Void) async throws {
+  func ensureLoaded(modelName: String, useGPU: Bool = false, progress: @escaping (Progress) -> Void) async throws {
     throw NSError(
       domain: "Parakeet",
       code: -2,
