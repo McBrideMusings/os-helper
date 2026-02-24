@@ -10,6 +10,9 @@ import Sauce
 public enum InputEvent {
     case keyboard(KeyEvent)
     case mouseClick
+    case mouseButton(Int)  // button number (3 = back, 4 = forward on most mice)
+    case leftDoubleClick
+    case rightDoubleClick
 }
 
 public struct KeyEvent {

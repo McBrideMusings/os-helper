@@ -95,6 +95,10 @@ struct SettingsFeature {
     case addWordRemapping
     case removeWordRemapping(UUID)
     case setRemappingScratchpadFocused(Bool)
+
+    // Mouse button actions (continuous dictation)
+    case setMouseButton3Action(MouseButtonAction)
+    case setMouseButton4Action(MouseButtonAction)
   }
 
   @Dependency(\.keyEventMonitor) var keyEventMonitor
@@ -365,6 +369,14 @@ struct SettingsFeature {
           }
         }
         
+        return .none
+
+      case let .setMouseButton3Action(action):
+        state.$hexSettings.withLock { $0.mouseButton3Action = action }
+        return .none
+
+      case let .setMouseButton4Action(action):
+        state.$hexSettings.withLock { $0.mouseButton4Action = action }
         return .none
 
       case let .setModifierSide(kind, side):

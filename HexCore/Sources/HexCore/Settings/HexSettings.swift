@@ -53,6 +53,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var wordRemappings: [WordRemapping]
 	public var mouseButton3Action: MouseButtonAction
 	public var mouseButton4Action: MouseButtonAction
+	public var doubleDoubleClickToSend: Bool
+	public var doubleRightClickToClear: Bool
 	public var continuousListeningPanelOffsets: [String: [CGFloat]]
 
 	public init(
@@ -80,6 +82,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		wordRemappings: [WordRemapping] = [],
 		mouseButton3Action: MouseButtonAction = .clearText,
 		mouseButton4Action: MouseButtonAction = .sendText,
+		doubleDoubleClickToSend: Bool = false,
+		doubleRightClickToClear: Bool = false,
 		continuousListeningPanelOffsets: [String: [CGFloat]] = [:]
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
@@ -106,6 +110,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.wordRemappings = wordRemappings
 		self.mouseButton3Action = mouseButton3Action
 		self.mouseButton4Action = mouseButton4Action
+		self.doubleDoubleClickToSend = doubleDoubleClickToSend
+		self.doubleRightClickToClear = doubleRightClickToClear
 		self.continuousListeningPanelOffsets = continuousListeningPanelOffsets
 	}
 
@@ -153,6 +159,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case wordRemappings
 	case mouseButton3Action
 	case mouseButton4Action
+	case doubleDoubleClickToSend
+	case doubleRightClickToClear
 	case continuousListeningPanelOffsets
 }
 
@@ -287,6 +295,8 @@ private enum HexSettingsSchema {
 		).eraseToAny(),
 		SettingsField(.mouseButton3Action, keyPath: \.mouseButton3Action, default: defaults.mouseButton3Action).eraseToAny(),
 		SettingsField(.mouseButton4Action, keyPath: \.mouseButton4Action, default: defaults.mouseButton4Action).eraseToAny(),
+		SettingsField(.doubleDoubleClickToSend, keyPath: \.doubleDoubleClickToSend, default: defaults.doubleDoubleClickToSend).eraseToAny(),
+		SettingsField(.doubleRightClickToClear, keyPath: \.doubleRightClickToClear, default: defaults.doubleRightClickToClear).eraseToAny(),
 		SettingsField(.continuousListeningPanelOffsets, keyPath: \.continuousListeningPanelOffsets, default: defaults.continuousListeningPanelOffsets).eraseToAny(),
 	]
 }

@@ -228,6 +228,10 @@ private extension TranscriptionFeature {
           case .startRecording, .stopRecording, .none:
             return false
           }
+
+        case .mouseButton, .leftDoubleClick, .rightDoubleClick:
+          // Mouse button/gesture actions are handled by AppFeature for continuous dictation
+          return false
         }
       }
 

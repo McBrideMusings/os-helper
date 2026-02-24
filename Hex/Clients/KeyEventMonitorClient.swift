@@ -399,6 +399,32 @@ class KeyEventMonitorClientLive {
 
           if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
             _ = hotKeyClientLive.processInputEvent(.mouseClick)
+
+            let clickState = cgEvent.getIntegerValueField(.mouseEventClickState)
+
+            // Emit double-click events for left/right mouse buttons
+            if clickState >= 2 {
+              if type == .leftMouseDown {
+                let handled = hotKeyClientLive.processInputEvent(.leftDoubleClick)
+                if handled {
+                  return nil
+                }
+              } else if type == .rightMouseDown {
+                let handled = hotKeyClientLive.processInputEvent(.rightDoubleClick)
+                if handled {
+                  return nil
+                }
+              }
+            }
+
+            // For "other" mouse buttons (3+), also send the specific button number
+            if type == .otherMouseDown {
+              let buttonNumber = Int(cgEvent.getIntegerValueField(.mouseEventButtonNumber))
+              let handled = hotKeyClientLive.processInputEvent(.mouseButton(buttonNumber))
+              if handled {
+                return nil  // Consume the event if handled
+              }
+            }
             return Unmanaged.passUnretained(cgEvent)
           }
 

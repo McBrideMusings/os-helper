@@ -74,6 +74,65 @@ struct GeneralSectionView: View {
 		} header: {
 			Text("General")
 		}
+
+		Section {
+			Label {
+				HStack(alignment: .center) {
+					Text("Mouse Button 3 (Back)")
+					Spacer()
+					Picker("", selection: Binding(
+						get: { store.hexSettings.mouseButton3Action },
+						set: { store.send(.setMouseButton3Action($0)) }
+					)) {
+						Text("None").tag(MouseButtonAction.none)
+						Text("Send Text").tag(MouseButtonAction.sendText)
+						Text("Clear Text").tag(MouseButtonAction.clearText)
+					}
+					.pickerStyle(.menu)
+				}
+			} icon: {
+				Image(systemName: "computermouse")
+			}
+
+			Label {
+				HStack(alignment: .center) {
+					Text("Mouse Button 4 (Forward)")
+					Spacer()
+					Picker("", selection: Binding(
+						get: { store.hexSettings.mouseButton4Action },
+						set: { store.send(.setMouseButton4Action($0)) }
+					)) {
+						Text("None").tag(MouseButtonAction.none)
+						Text("Send Text").tag(MouseButtonAction.sendText)
+						Text("Clear Text").tag(MouseButtonAction.clearText)
+					}
+					.pickerStyle(.menu)
+				}
+			} icon: {
+				Image(systemName: "computermouse")
+			}
+
+			Label {
+				Toggle("Double-double-click to send", isOn: $store.hexSettings.doubleDoubleClickToSend)
+				Text("Double-click twice in quick succession to send text. A single double-click still selects text normally.")
+					.settingsCaption()
+			} icon: {
+				Image(systemName: "cursorarrow.click.2")
+			}
+
+			Label {
+				Toggle("Double-right-click to clear", isOn: $store.hexSettings.doubleRightClickToClear)
+				Text("Double-right-click to clear accumulated text.")
+					.settingsCaption()
+			} icon: {
+				Image(systemName: "cursorarrow.click.2")
+			}
+
+			Text("Assign mouse buttons or click gestures to send or clear text during continuous dictation mode.")
+				.settingsCaption()
+		} header: {
+			Text("Mouse Buttons (Continuous Dictation)")
+		}
 		.enableInjection()
 	}
 }

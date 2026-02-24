@@ -18,6 +18,7 @@ struct StreamingAudioClient {
   var startCapture: @Sendable () async throws -> Void
   var stopCapture: @Sendable () async -> Void
   var flushBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
+  var peekBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
   var observeMeterLevels: @Sendable () -> AsyncStream<Float> = { .finished }
   var observeAudioChunks: @Sendable () -> AsyncStream<[AVAudioPCMBuffer]> = { .finished }
 }
@@ -29,6 +30,7 @@ extension StreamingAudioClient: DependencyKey {
       startCapture: { try await live.startCapture() },
       stopCapture: { await live.stopCapture() },
       flushBuffers: { await live.flushBuffers() },
+      peekBuffers: { await live.peekBuffers() },
       observeMeterLevels: { live.startMeterStream() },
       observeAudioChunks: { live.startChunkStream() }
     )
@@ -95,7 +97,12 @@ private actor StreamingAudioClientLive {
       sumOfSquares += sample * sample
     }
     let rms = sqrtf(sumOfSquares / Float(frames))
-    return min(rms * 3.0, 1.0)
+    // Convert to dB scale for perceptually linear response, then normalize.
+    // Raw RMS of speech is typically 0.005-0.1 which is nearly invisible on a linear scale.
+    let db = 20 * log10f(max(rms, 1e-6))
+    // Map -60dB..0dB to 0..1
+    let normalized = (db + 60) / 60
+    return max(min(normalized, 1.0), 0.0)
   }
 
   // MARK: - Meter & VAD
@@ -127,6 +134,9 @@ private actor StreamingAudioClientLive {
   // MARK: - Capture
 
   func startCapture() throws {
+    // Select microphone if configured
+    configureInputDevice()
+
     let engine = AVAudioEngine()
     let inputNode = engine.inputNode
     let hardwareFormat = inputNode.outputFormat(forBus: 0)
@@ -135,12 +145,8 @@ private actor StreamingAudioClientLive {
       "Hardware format: \(hardwareFormat.sampleRate)Hz, \(hardwareFormat.channelCount)ch"
     )
 
-    // Select microphone if configured
-    configureInputDevice()
-
-    // Install tap at the hardware's native format — we'll convert in flushBuffers
     let bufferSize: AVAudioFrameCount = 4096
-    inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: hardwareFormat) {
+    inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) {
       [weak self] buffer, _ in
       guard let self else { return }
       let level = Self.computeRMS(buffer: buffer)
@@ -182,6 +188,10 @@ private actor StreamingAudioClientLive {
     let flushed = buffers
     buffers.removeAll()
     return flushed
+  }
+
+  func peekBuffers() -> [AVAudioPCMBuffer] {
+    return Array(buffers)
   }
 
   private func appendBuffer(_ buffer: AVAudioPCMBuffer) {
