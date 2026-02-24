@@ -21,6 +21,7 @@ struct StreamingAudioClient {
   var peekBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
   var observeMeterLevels: @Sendable () -> AsyncStream<Float> = { .finished }
   var observeAudioChunks: @Sendable () -> AsyncStream<[AVAudioPCMBuffer]> = { .finished }
+  var observeRawBuffers: @Sendable () -> AsyncStream<AVAudioPCMBuffer> = { .finished }
 }
 
 extension StreamingAudioClient: DependencyKey {
@@ -32,7 +33,8 @@ extension StreamingAudioClient: DependencyKey {
       flushBuffers: { await live.flushBuffers() },
       peekBuffers: { await live.peekBuffers() },
       observeMeterLevels: { live.startMeterStream() },
-      observeAudioChunks: { live.startChunkStream() }
+      observeAudioChunks: { live.startChunkStream() },
+      observeRawBuffers: { live.startRawBufferStream() }
     )
   }
 }
@@ -55,12 +57,17 @@ private actor StreamingAudioClientLive {
   // Meter stream
   private var meterContinuation: AsyncStream<Float>.Continuation?
 
+  // Raw buffer stream (for streaming transcription)
+  private var rawBufferContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+
   // VAD-triggered chunk stream
   private var chunkContinuation: AsyncStream<[AVAudioPCMBuffer]>.Continuation?
   private let silenceThreshold: Float = 0.01
   private let silenceDuration: TimeInterval = 0.4
   private var isVoiceActive: Bool = false
   private var silenceStart: Date?
+  private var voiceStartTime: Date?
+  private let maxChunkDuration: TimeInterval = 5.0
 
   // MARK: - Stream factories (nonisolated for sync access)
 
@@ -76,12 +83,22 @@ private actor StreamingAudioClientLive {
     }
   }
 
+  nonisolated func startRawBufferStream() -> AsyncStream<AVAudioPCMBuffer> {
+    AsyncStream<AVAudioPCMBuffer> { continuation in
+      Task { await self.setRawBufferContinuation(continuation) }
+    }
+  }
+
   private func setMeterContinuation(_ continuation: AsyncStream<Float>.Continuation) {
     meterContinuation = continuation
   }
 
   private func setChunkContinuation(_ continuation: AsyncStream<[AVAudioPCMBuffer]>.Continuation) {
     chunkContinuation = continuation
+  }
+
+  private func setRawBufferContinuation(_ continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) {
+    rawBufferContinuation = continuation
   }
 
   // MARK: - RMS
@@ -113,8 +130,20 @@ private actor StreamingAudioClientLive {
 
   private func processVAD(level: Float) {
     if level >= silenceThreshold {
+      if !isVoiceActive {
+        voiceStartTime = Date()
+      }
       isVoiceActive = true
       silenceStart = nil
+
+      // Force-flush if voice has been active longer than maxChunkDuration
+      if let start = voiceStartTime, Date().timeIntervalSince(start) >= maxChunkDuration {
+        if !buffers.isEmpty {
+          chunkContinuation?.yield(buffers)
+          buffers.removeAll()
+        }
+        voiceStartTime = Date()
+      }
     } else if isVoiceActive {
       if silenceStart == nil {
         silenceStart = Date()
@@ -127,6 +156,7 @@ private actor StreamingAudioClientLive {
         }
         isVoiceActive = false
         silenceStart = nil
+        voiceStartTime = nil
       }
     }
   }
@@ -178,6 +208,8 @@ private actor StreamingAudioClientLive {
     meterContinuation = nil
     chunkContinuation?.finish()
     chunkContinuation = nil
+    rawBufferContinuation?.finish()
+    rawBufferContinuation = nil
     isVoiceActive = false
     silenceStart = nil
 
@@ -196,6 +228,7 @@ private actor StreamingAudioClientLive {
 
   private func appendBuffer(_ buffer: AVAudioPCMBuffer) {
     buffers.append(buffer)
+    rawBufferContinuation?.yield(buffer)
   }
 
   private func configureInputDevice() {
