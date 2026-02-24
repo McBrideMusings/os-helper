@@ -29,12 +29,16 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 ### Features (TCA Reducers)
 - `AppFeature`: Root feature coordinating the app lifecycle
 - `TranscriptionFeature`: Core recording and transcription logic
+- `ContinuousListeningFeature`: Continuous dictation with configurable backends
 - `SettingsFeature`: User preferences and configuration
 - `HistoryFeature`: Transcription history management
 
 ### Dependency Clients
-- `TranscriptionClient`: WhisperKit integration for ML transcription
+- `TranscriptionClient`: WhisperKit/Parakeet integration for ML transcription
+- `StreamingTranscriptionClient`: FluidAudio streaming ASR for live transcription
+- `StreamingAudioClient`: AVAudioEngine-based capture with VAD chunking and raw buffer streams
 - `RecordingClient`: AVAudioRecorder wrapper for audio capture
+- `ParakeetClient`: FluidAudio model loading with configurable compute units (GPU/ANE)
 - `PasteboardClient`: Clipboard operations
 - `KeyEventMonitorClient`: Global hotkey monitoring via Sauce framework
 
@@ -62,7 +66,14 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 
 5. **Permissions**: Requires audio input and automation entitlements (see `Hex.entitlements`)
 
-6. **Logging**: All diagnostics should use the unified logging helper `HexLog` (`HexCore/Sources/HexCore/Logging.swift`). Pick an existing category (e.g., `.transcription`, `.recording`, `.settings`) or add a new case so Console predicates stay consistent. Avoid `print` and prefer privacy annotations (`, privacy: .private`) for anything potentially sensitive like transcript text or file paths.
+6. **Continuous Listening / Continuous Dictation**: Activated via double-tap hotkey (handled in `AppFeature`). Supports two backends configured via `HexSettings.continuousListeningBackend`:
+   - **Chunked (default)**: `StreamingAudioClient` does VAD-based silence detection and emits `[AVAudioPCMBuffer]` chunks. `ContinuousListeningFeature` writes each chunk to a temp WAV via `AudioBufferWriter`, then transcribes it through `TranscriptionClient` (works with both Parakeet and WhisperKit). An interim timer peeks at accumulated buffers every 1.5s for gray preview text.
+   - **Streaming**: Raw audio buffers are forwarded to `StreamingTranscriptionClient` which wraps FluidAudio's `StreamingAsrManager`. Produces volatile (gray) and confirmed text updates. Key tuning params: `streamingMinConfirmationContext` (default 3s) and `streamingConfirmationThreshold` (default 0.80).
+   - Both backends produce `TextBlock` items and optional `interimText` consumed by `ContinuousListeningPanel`.
+   - GPU acceleration toggle (`useGPUAcceleration`) routes Parakeet through `MLModelConfiguration.computeUnits = .all` vs `.cpuAndNeuralEngine`.
+   - Settings UI lives in `GeneralSectionView` under "Continuous Dictation Engine".
+
+7. **Logging**: All diagnostics should use the unified logging helper `HexLog` (`HexCore/Sources/HexCore/Logging.swift`). Pick an existing category (e.g., `.transcription`, `.recording`, `.settings`) or add a new case so Console predicates stay consistent. Avoid `print` and prefer privacy annotations (`, privacy: .private`) for anything potentially sensitive like transcript text or file paths.
 
 ## Models (2025‑11)
 
@@ -136,9 +147,9 @@ FluidAudio models reside under `Application Support/FluidAudio/Models`.
 
 ## Git Commit Messages
 
-- Use a concise, descriptive subject line that captures the user-facing impact (roughly 50–70 characters).
-- Follow up with as much context as needed in the body. Include the rationale, notable tradeoffs, relevant logs, or reproduction steps—future debugging benefits from having the full story directly in git history.
-- Reference any related GitHub issues in the body if the change tracks ongoing work.
+- One sentence, high-level summary. No body — let the diff speak for itself.
+- No conventional commit prefixes (`feat:`, `fix:`, `type(scope):`, etc.).
+- No mention of tooling used to write the code.
 
 ## Releasing a New Version
 

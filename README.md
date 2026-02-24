@@ -19,8 +19,9 @@ Once you open Hex, you'll need to grant it microphone and accessibility permissi
 
 Once you've configured a global hotkey, there are **two recording modes**:
 
-1. **Press-and-hold** the hotkey to begin recording, say whatever you want, and then release the hotkey to start the transcription process. 
+1. **Press-and-hold** the hotkey to begin recording, say whatever you want, and then release the hotkey to start the transcription process.
 2. **Double-tap** the hotkey to *lock recording*, say whatever you want, and then **tap** the hotkey once more to start the transcription process.
+3. **Continuous dictation** — double-tap while no recording is active to enter continuous listening mode. A floating panel appears with live transcription. Text accumulates across pauses and can be sent to the target app on demand. Configure the transcription engine (chunked VAD or streaming) in Settings → General.
 
 ## Contributing
 
