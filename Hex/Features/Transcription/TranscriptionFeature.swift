@@ -40,6 +40,7 @@ struct TranscriptionFeature {
     // Hotkey actions
     case hotKeyPressed
     case hotKeyReleased
+    case hotKeyDoubleTapped
 
     // Recording flow
     case startRecording
@@ -96,11 +97,15 @@ struct TranscriptionFeature {
       // MARK: - HotKey Flow
 
       case .hotKeyPressed:
-        // Routed by AppFeature to continuous listening toggle
+        // Routed by AppFeature
         return .none
 
       case .hotKeyReleased:
-        // Continuous listening mode ignores release
+        // Routed by AppFeature
+        return .none
+
+      case .hotKeyDoubleTapped:
+        // Routed by AppFeature for continuous mode toggle
         return .none
 
       // MARK: - Recording Flow
@@ -185,16 +190,32 @@ private extension TranscriptionFeature {
             return false
           }
 
-          // Process the key event
-          switch hotKeyProcessor.process(keyEvent: keyEvent) {
+          // Capture state before processing for transition detection
+          let prevState = hotKeyProcessor.state
+          let output = hotKeyProcessor.process(keyEvent: keyEvent)
+          let newState = hotKeyProcessor.state
+
+          // Detect silent transition to doubleTapLock (no output emitted)
+          if output == nil,
+             newState == .doubleTapLock,
+             prevState != .doubleTapLock
+          {
+            Task { await send(.hotKeyDoubleTapped) }
+            return true
+          }
+
+          switch output {
           case .startRecording:
-            // Toggle continuous listening mode
             Task { await send(.hotKeyPressed) }
             return hexSettings.useDoubleTapOnly || keyEvent.key != nil
 
           case .stopRecording:
-            // In continuous mode, ignore release
-            Task { await send(.hotKeyReleased) }
+            // If we just left doubleTapLock, this is a double-tap toggle-off
+            if prevState == .doubleTapLock {
+              Task { await send(.hotKeyDoubleTapped) }
+            } else {
+              Task { await send(.hotKeyReleased) }
+            }
             return false
 
           case .cancel:

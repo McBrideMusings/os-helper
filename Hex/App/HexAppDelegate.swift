@@ -118,13 +118,16 @@ class HexAppDelegate: NSObject, NSApplicationDelegate {
 			var wasActive = false
 			var lastScreenID: CGDirectDisplayID?
 			while !Task.isCancelled {
-				let isActive = store.state.continuousListening.isActive
+				let isActive = store.state.continuousListening.panelVisible
 				if isActive != wasActive {
+					appLogger.notice("Panel observer: panelVisible changed \(wasActive) → \(isActive)")
 					wasActive = isActive
 					if isActive {
+						appLogger.notice("Panel observer: showing panel")
 						self?.showContinuousListeningPanel()
 						lastScreenID = self?.continuousListeningPanel?.screen?.displayID
 					} else {
+						appLogger.notice("Panel observer: hiding panel")
 						self?.hideContinuousListeningPanel()
 						lastScreenID = nil
 					}

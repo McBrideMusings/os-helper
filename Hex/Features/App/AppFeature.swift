@@ -11,6 +11,8 @@ import Dependencies
 import HexCore
 import SwiftUI
 
+private let appFeatureLogger = HexLog.app
+
 @Reducer
 struct AppFeature {
   enum ActiveTab: Equatable {
@@ -106,9 +108,37 @@ struct AppFeature {
         return .none
 
       case .transcription(.hotKeyPressed):
-        return .send(.continuousListening(.toggleMode))
+        let panelVis = state.continuousListening.panelVisible
+        let mode = state.continuousListening.recordingMode
+        appFeatureLogger.notice("hotKeyPressed → showPanel + startPushToTalk (panelVisible=\(panelVis) recordingMode=\(String(describing: mode)))")
+        return .merge(
+          .send(.continuousListening(.showPanel)),
+          .send(.continuousListening(.startPushToTalk))
+        )
 
       case .transcription(.hotKeyReleased):
+        let mode = state.continuousListening.recordingMode
+        appFeatureLogger.notice("hotKeyReleased (recordingMode=\(String(describing: mode)))")
+        if state.continuousListening.recordingMode == .pushToTalk {
+          return .send(.continuousListening(.stopPushToTalk))
+        }
+        return .none
+
+      case .transcription(.hotKeyDoubleTapped):
+        let panelVis = state.continuousListening.panelVisible
+        let mode = state.continuousListening.recordingMode
+        appFeatureLogger.notice("hotKeyDoubleTapped → showPanel + toggleContinuousMode (panelVisible=\(panelVis) recordingMode=\(String(describing: mode)))")
+        return .merge(
+          .send(.continuousListening(.showPanel)),
+          .send(.continuousListening(.toggleContinuousMode))
+        )
+
+      case .transcription(.cancel):
+        // If the panel is visible, ESC stops recording but keeps panel open
+        if state.continuousListening.panelVisible, state.continuousListening.isActive {
+          state.continuousListening.recordingMode = .idle
+          return .send(.continuousListening(.stopListening))
+        }
         return .none
 
       case .transcription(.modelMissing):
@@ -277,9 +307,9 @@ struct AppFeature {
       nonisolated(unsafe) var lastLeftDoubleClickTime: ContinuousClock.Instant? = nil
 
       let token = keyEventMonitor.handleInputEvent { inputEvent in
-        // Only handle when continuous listening is active
+        // Only handle when continuous listening panel is visible
         let store = HexApp.appStore
-        guard store.state.continuousListening.isActive else {
+        guard store.state.continuousListening.panelVisible else {
           return false
         }
 
@@ -354,10 +384,9 @@ struct AppFeature {
           return false
         }
 
-        // Only intercept when continuous listening is active —
-        // we read state via the store synchronously on MainActor
+        // Only intercept when continuous listening panel is visible
         let store = HexApp.appStore
-        guard store.state.continuousListening.isActive else {
+        guard store.state.continuousListening.panelVisible else {
           return false
         }
 

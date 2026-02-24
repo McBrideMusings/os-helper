@@ -56,6 +56,19 @@ struct ContinuousListeningOverlayView: View {
 
   private var hasError: Bool { store.hasCaptureError }
 
+  private var statusText: String {
+    if hasError { return "Error" }
+    switch store.recordingMode {
+    case .idle: return "Ready"
+    case .pushToTalk: return "Recording..."
+    case .continuous: return "Listening..."
+    }
+  }
+
+  private var isRecording: Bool {
+    store.recordingMode != .idle
+  }
+
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       // Header
@@ -65,17 +78,21 @@ struct ContinuousListeningOverlayView: View {
             .fill(.gray)
             .frame(width: 8, height: 8)
           AudioLevelBars(level: 0, disabled: true)
-          Text("Error")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.secondary)
-        } else {
+        } else if isRecording {
           PulsingDot()
           AudioLevelBars(level: store.meterLevel)
-          Text("Listening...")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.primary)
+        } else {
+          Circle()
+            .fill(.gray.opacity(0.5))
+            .frame(width: 8, height: 8)
+          AudioLevelBars(level: 0, disabled: true)
         }
+        Text(statusText)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(isRecording ? .primary : .secondary)
         Spacer()
+        // Close button
+        CloseButton { store.send(.hidePanel) }
       }
 
       Divider()
@@ -105,10 +122,25 @@ struct ContinuousListeningOverlayView: View {
           .foregroundStyle(.red)
           .lineLimit(3)
       }
+
+      Divider()
+
+      // Footer
+      HStack {
+        MicButton(recordingMode: store.recordingMode) {
+          store.send(.startPushToTalk)
+        } onRelease: {
+          store.send(.stopPushToTalk)
+        } onDoubleTap: {
+          store.send(.toggleContinuousMode)
+        }
+        Spacer()
+        TextDragHandle(textBlocks: store.textBlocks)
+      }
     }
     .padding(12)
     .frame(width: 320)
-    .frame(minHeight: 80, maxHeight: 200)
+    .frame(minHeight: 100, maxHeight: 240)
     .background(.ultraThinMaterial)
     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
   }
@@ -130,7 +162,7 @@ private struct FlowingTextView: View {
   @State private var tickTask: Task<Void, Never>?
 
   /// How long a word stays gray before it's fully white.
-  private let settleDuration: TimeInterval = 1.5
+  private let settleDuration: TimeInterval = 0.8
 
   private var totalCompletedWords: Int {
     textBlocks.filter { $0.status == .complete }
@@ -150,7 +182,7 @@ private struct FlowingTextView: View {
   var body: some View {
     let hasContent = !textBlocks.isEmpty || interimText != nil || isCapturingAudio
     if !hasContent {
-      Text("Speak to start...")
+      Text("Press record or use hotkey to start")
         .font(.system(size: 13))
         .foregroundStyle(.tertiary)
         .italic()
@@ -163,11 +195,13 @@ private struct FlowingTextView: View {
         .onChange(of: totalCompletedWords) { _, newTotal in
           if newTotal < lastKnownTotal {
             wordAppearTimes.removeAll()
+            lastKnownTotal = 0
           }
           let now = Date()
+          let staggerDelay: TimeInterval = 0.06
           for i in lastKnownTotal..<newTotal {
             if wordAppearTimes[i] == nil {
-              wordAppearTimes[i] = now
+              wordAppearTimes[i] = now + Double(i - lastKnownTotal) * staggerDelay
             }
           }
           lastKnownTotal = newTotal
@@ -283,6 +317,104 @@ private struct AudioLevelBars: View {
     let maxHeight: CGFloat = 16
     let scaled = CGFloat(level * weight)
     return minHeight + scaled * (maxHeight - minHeight)
+  }
+}
+
+// MARK: - Mic Button
+
+private struct MicButton: View {
+  let recordingMode: ContinuousListeningFeature.RecordingMode
+  let onPress: () -> Void
+  let onRelease: () -> Void
+  let onDoubleTap: () -> Void
+
+  @State private var isPressed = false
+
+  private var isRecording: Bool {
+    recordingMode != .idle
+  }
+
+  var body: some View {
+    Image(systemName: isRecording ? "mic.fill" : "mic")
+      .font(.system(size: 14, weight: .medium))
+      .foregroundStyle(isRecording ? .red : .secondary)
+      .frame(width: 28, height: 28)
+      .background(
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+          .fill(isRecording ? Color.red.opacity(0.15) : Color.clear)
+      )
+      .scaleEffect(isPressed ? 0.9 : 1.0)
+      .animation(.easeInOut(duration: 0.1), value: isPressed)
+      .contentShape(Rectangle())
+      .onTapGesture(count: 2) {
+        onDoubleTap()
+      }
+      .simultaneousGesture(
+        DragGesture(minimumDistance: 0)
+          .onChanged { _ in
+            if !isPressed {
+              isPressed = true
+              onPress()
+            }
+          }
+          .onEnded { _ in
+            isPressed = false
+            onRelease()
+          }
+      )
+  }
+}
+
+// MARK: - Text Drag Handle
+
+private struct TextDragHandle: View {
+  let textBlocks: IdentifiedArrayOf<TextBlock>
+
+  private var fullText: String {
+    textBlocks
+      .filter { $0.status == .complete }
+      .map(\.text)
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var body: some View {
+    let hasText = !fullText.isEmpty
+    Image(systemName: "line.3.horizontal")
+      .font(.system(size: 12, weight: .medium))
+      .foregroundStyle(hasText ? .secondary : .quaternary)
+      .frame(width: 28, height: 28)
+      .contentShape(Rectangle())
+      .draggable(fullText) {
+        Text(String(fullText.prefix(60)) + (fullText.count > 60 ? "..." : ""))
+          .font(.system(size: 11))
+          .padding(6)
+          .background(.ultraThinMaterial)
+          .clipShape(RoundedRectangle(cornerRadius: 6))
+      }
+      .disabled(!hasText)
+  }
+}
+
+// MARK: - Close Button
+
+private struct CloseButton: View {
+  let action: () -> Void
+
+  var body: some View {
+    Image(systemName: "xmark")
+      .font(.system(size: 10, weight: .bold))
+      .foregroundStyle(.secondary)
+      .frame(width: 20, height: 20)
+      .contentShape(Rectangle())
+      .onTapGesture { action() }
+      .onHover { inside in
+        if inside {
+          NSCursor.arrow.push()
+        } else {
+          NSCursor.pop()
+        }
+      }
   }
 }
 

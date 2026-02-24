@@ -48,9 +48,17 @@ struct TextBlock: Equatable, Identifiable {
 
 @Reducer
 struct ContinuousListeningFeature {
+  enum RecordingMode: Equatable {
+    case idle
+    case continuous
+    case pushToTalk
+  }
+
   @ObservableState
   struct State {
     var isActive: Bool = false
+    var panelVisible: Bool = false
+    var recordingMode: RecordingMode = .idle
     var textBlocks: IdentifiedArrayOf<TextBlock> = []
     var interimText: String?
     var meterLevel: Float = 0
@@ -66,6 +74,14 @@ struct ContinuousListeningFeature {
     case startListening
     case stopListening
     case meterLevelUpdated(Float)
+    // Panel lifecycle
+    case showPanel
+    case hidePanel
+    // Recording modes
+    case startPushToTalk
+    case stopPushToTalk
+    case confirmStopPushToTalk
+    case toggleContinuousMode
     // Streaming mode
     case streamingUpdate(StreamingTextUpdate)
     case streamingError(String)
@@ -93,6 +109,7 @@ struct ContinuousListeningFeature {
     case interimTranscription
     case watchdog
     case recovery
+    case deferredPTTStop
   }
 
   @Dependency(\.streamingAudio) var streamingAudio
@@ -119,11 +136,87 @@ struct ContinuousListeningFeature {
           return .send(.startListening)
         }
 
+      // MARK: - Panel Lifecycle
+
+      case .showPanel:
+        guard !state.panelVisible else { return .none }
+        state.panelVisible = true
+        state.recordingMode = .idle
+        // Capture the frontmost app before panel appears
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        state.sourceAppBundleID = frontApp?.bundleIdentifier
+        state.sourceAppName = frontApp?.localizedName
+        logger.notice(
+          "Panel shown, target app: \(frontApp?.localizedName ?? "unknown", privacy: .public)"
+        )
+        return .none
+
+      case .hidePanel:
+        state.panelVisible = false
+        state.recordingMode = .idle
+        state.textBlocks = []
+        state.interimText = nil
+        state.error = nil
+        logger.notice("Panel hidden, text cleared")
+        if state.isActive {
+          return .send(.stopListening)
+        }
+        return .none
+
+      // MARK: - Recording Modes
+
+      case .startPushToTalk:
+        let isActive = state.isActive
+        let panelVis = state.panelVisible
+        logger.notice("startPushToTalk: isActive=\(isActive) panelVisible=\(panelVis)")
+        state.recordingMode = .pushToTalk
+        // Cancel any deferred stop from a previous PTT release
+        let cancelDeferred = Effect<Action>.cancel(id: CancelID.deferredPTTStop)
+        if state.isActive {
+          return cancelDeferred
+        }
+        return .merge(cancelDeferred, .send(.startListening))
+
+      case .stopPushToTalk:
+        let mode = state.recordingMode
+        logger.notice("stopPushToTalk: recordingMode=\(String(describing: mode))")
+        guard state.recordingMode == .pushToTalk else { return .none }
+        // Defer the actual stop by 350ms to allow double-tap upgrade to continuous
+        return .run { send in
+          try await Task.sleep(for: .milliseconds(350))
+          await send(.confirmStopPushToTalk)
+        }
+        .cancellable(id: CancelID.deferredPTTStop, cancelInFlight: true)
+
+      case .confirmStopPushToTalk:
+        let mode = state.recordingMode
+        let panelVis = state.panelVisible
+        logger.notice("confirmStopPushToTalk: recordingMode=\(String(describing: mode)) panelVisible=\(panelVis)")
+        // Only stop if still in PTT mode (not upgraded to continuous)
+        guard state.recordingMode == .pushToTalk else { return .none }
+        state.recordingMode = .idle
+        return .send(.stopListening)
+
+      case .toggleContinuousMode:
+        // Cancel any deferred PTT stop
+        let cancelDeferred = Effect<Action>.cancel(id: CancelID.deferredPTTStop)
+        if state.recordingMode == .continuous {
+          state.recordingMode = .idle
+          logger.notice("Continuous mode toggled OFF")
+          return .merge(cancelDeferred, .send(.stopListening))
+        } else {
+          state.recordingMode = .continuous
+          logger.notice("Continuous mode toggled ON")
+          if state.isActive {
+            return cancelDeferred
+          }
+          return .merge(cancelDeferred, .send(.startListening))
+        }
+
       case .startListening:
         state.isActive = true
         state.hasCaptureError = false
         state.$isContinuousListeningActive.withLock { $0 = true }
-        state.textBlocks = []
         state.meterLevel = 0
         state.error = nil
         state.interimText = nil
@@ -179,11 +272,8 @@ struct ContinuousListeningFeature {
         state.isActive = false
         state.hasCaptureError = false
         state.$isContinuousListeningActive.withLock { $0 = false }
-        state.textBlocks = []
         state.interimText = nil
         state.meterLevel = 0
-        state.sourceAppBundleID = nil
-        state.sourceAppName = nil
         state.error = nil
 
         return .merge(
