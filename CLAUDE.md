@@ -1,10 +1,23 @@
-# Hex – Dev Notes for Agents
+# OS Helper – Dev Notes for Agents
 
 This file provides guidance for coding agents working in this repo.
 
 ## Project Overview
 
-Hex is a macOS menu bar application for on‑device voice‑to‑text. It supports Whisper (Core ML via WhisperKit) and Parakeet TDT v3 (Core ML via FluidAudio). Users activate transcription with hotkeys; text can be auto‑pasted into the active app.
+OS Helper (née Hex) is a macOS menu bar application for on‑device voice‑to‑text, evolving into an agentic voice assistant. It supports Whisper (Core ML via WhisperKit) and Parakeet TDT v3 (Core ML via FluidAudio). Users activate transcription with hotkeys; text can be auto‑pasted into the active app.
+
+### Voice Agent Roadmap
+
+The project is extending from pure transcription into a cursor-based interaction model: always-on dictation where voice either pastes text into input fields or routes commands to an LLM agent with macOS tool-use capabilities. Work is tracked across 6 GitHub milestones:
+
+1. **M1: Buffer Management Rework** — Text accumulates until explicit user action (no auto-dispatch)
+2. **M2: Cursor Targeting & Interaction** — Mouse/keyboard interaction model for targeting where text goes
+3. **M3: UI Element Detection (AX)** — Accessibility API queries to classify what's under the cursor
+4. **M4: Agent Layer & LLM Integration** — TCA-based agent feature with Anthropic API, tool registry, confirmation flows
+5. **M5: Core macOS Tools** — ~10 native tools (open app, click element, type text, AppleScript, file ops, etc.)
+6. **M6: Smart Intent Routing** — Auto paste-vs-agent routing based on AX element detection + per-app overrides
+
+Dependency chain: M1 → M2 → (M3 ∥ M4) → M5 → M6. See `gh issue list` for full details.
 
 ## Build & Development Commands
 
