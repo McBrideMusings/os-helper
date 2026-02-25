@@ -65,6 +65,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 	public var streamingConfirmationThreshold: Double
 	public var streamingMinConfirmationContext: Double
 	public var useGPUAcceleration: Bool
+	public var segmentSplittingEnabled: Bool
+	public var segmentSilenceThreshold: Double
 
 	public init(
 		soundEffectsEnabled: Bool = true,
@@ -97,7 +99,9 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		continuousListeningBackend: ContinuousListeningBackend = .chunked,
 		streamingConfirmationThreshold: Double = 0.80,
 		streamingMinConfirmationContext: Double = 3.0,
-		useGPUAcceleration: Bool = false
+		useGPUAcceleration: Bool = false,
+		segmentSplittingEnabled: Bool = true,
+		segmentSilenceThreshold: Double = 2.0
 	) {
 		self.soundEffectsEnabled = soundEffectsEnabled
 		self.soundEffectsVolume = soundEffectsVolume
@@ -130,6 +134,8 @@ public struct HexSettings: Codable, Equatable, Sendable {
 		self.streamingConfirmationThreshold = streamingConfirmationThreshold
 		self.streamingMinConfirmationContext = streamingMinConfirmationContext
 		self.useGPUAcceleration = useGPUAcceleration
+		self.segmentSplittingEnabled = segmentSplittingEnabled
+		self.segmentSilenceThreshold = segmentSilenceThreshold
 	}
 
 	public init(from decoder: Decoder) throws {
@@ -183,6 +189,8 @@ private enum HexSettingKey: String, CodingKey, CaseIterable {
 	case streamingConfirmationThreshold
 	case streamingMinConfirmationContext
 	case useGPUAcceleration
+	case segmentSplittingEnabled
+	case segmentSilenceThreshold
 }
 
 private struct SettingsField<Value: Codable & Sendable> {
@@ -323,5 +331,7 @@ private enum HexSettingsSchema {
 		SettingsField(.streamingConfirmationThreshold, keyPath: \.streamingConfirmationThreshold, default: defaults.streamingConfirmationThreshold).eraseToAny(),
 		SettingsField(.streamingMinConfirmationContext, keyPath: \.streamingMinConfirmationContext, default: defaults.streamingMinConfirmationContext).eraseToAny(),
 		SettingsField(.useGPUAcceleration, keyPath: \.useGPUAcceleration, default: defaults.useGPUAcceleration).eraseToAny(),
+		SettingsField(.segmentSplittingEnabled, keyPath: \.segmentSplittingEnabled, default: defaults.segmentSplittingEnabled).eraseToAny(),
+		SettingsField(.segmentSilenceThreshold, keyPath: \.segmentSilenceThreshold, default: defaults.segmentSilenceThreshold).eraseToAny(),
 	]
 }

@@ -57,6 +57,7 @@ struct ContinuousListeningOverlayView: View {
   private var hasError: Bool { store.hasCaptureError }
 
   private var statusText: String {
+    if store.isAwaitingDispatch { return "Sending..." }
     if hasError { return "Error" }
     switch store.recordingMode {
     case .idle: return "Ready"
@@ -73,7 +74,11 @@ struct ContinuousListeningOverlayView: View {
     VStack(alignment: .leading, spacing: 8) {
       // Header
       HStack(spacing: 6) {
-        if hasError {
+        if store.isAwaitingDispatch {
+          ProgressView()
+            .controlSize(.small)
+            .frame(width: 8, height: 8)
+        } else if hasError {
           Circle()
             .fill(.gray)
             .frame(width: 8, height: 8)
@@ -103,7 +108,8 @@ struct ContinuousListeningOverlayView: View {
           FlowingTextView(
             textBlocks: store.textBlocks,
             interimText: store.interimText,
-            isCapturingAudio: !hasError && store.meterLevel > 0.05
+            isCapturingAudio: !hasError && store.meterLevel > 0.05,
+            sessionDividerVisible: store.sessionDividerVisible
           )
           .frame(maxWidth: .infinity, alignment: .leading)
           .id("bottom")
@@ -152,6 +158,7 @@ private struct FlowingTextView: View {
   let textBlocks: IdentifiedArrayOf<TextBlock>
   let interimText: String?
   let isCapturingAudio: Bool
+  var sessionDividerVisible: Bool = false
 
   /// Timestamps when each word first appeared, keyed by global word index.
   @State private var wordAppearTimes: [Int: Date] = [:]
@@ -240,7 +247,14 @@ private struct FlowingTextView: View {
     var globalWordIndex = 0
     var result = textBlocks.enumerated().reduce(Text("")) { acc, pair in
       let (index, block) = pair
-      let separator = index > 0 ? Text(" ") : Text("")
+      let separator: Text
+      if index == 0 {
+        separator = Text("")
+      } else if block.isSessionStart {
+        separator = Text("\n─────────\n").foregroundColor(.secondary.opacity(0.3))
+      } else {
+        separator = Text(" ")
+      }
       switch block.status {
       case .complete:
         let words = block.text.split(separator: " ")
@@ -262,8 +276,20 @@ private struct FlowingTextView: View {
       }
     }
 
+    // Show trailing session divider when silence threshold exceeded
+    if sessionDividerVisible && !textBlocks.isEmpty {
+      result = result + Text("\n─────────").foregroundColor(.secondary.opacity(0.3))
+    }
+
     if let interim = interimText {
-      let separator = textBlocks.isEmpty ? Text("") : Text(" ")
+      let separator: Text
+      if textBlocks.isEmpty {
+        separator = Text("")
+      } else if sessionDividerVisible {
+        separator = Text("\n")
+      } else {
+        separator = Text(" ")
+      }
       result = result + separator + Text(interim)
         .foregroundColor(.secondary.opacity(0.7))
     }
@@ -371,11 +397,14 @@ private struct TextDragHandle: View {
   let textBlocks: IdentifiedArrayOf<TextBlock>
 
   private var fullText: String {
-    textBlocks
-      .filter { $0.status == .complete }
-      .map(\.text)
-      .joined(separator: " ")
-      .trimmingCharacters(in: .whitespacesAndNewlines)
+    var text = ""
+    for block in textBlocks where block.status == .complete {
+      if !text.isEmpty {
+        text += block.isSessionStart ? "\n" : " "
+      }
+      text += block.text
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   var body: some View {
@@ -402,19 +431,21 @@ private struct CloseButton: View {
   let action: () -> Void
 
   var body: some View {
-    Image(systemName: "xmark")
-      .font(.system(size: 10, weight: .bold))
-      .foregroundStyle(.secondary)
-      .frame(width: 20, height: 20)
-      .contentShape(Rectangle())
-      .onTapGesture { action() }
-      .onHover { inside in
-        if inside {
-          NSCursor.arrow.push()
-        } else {
-          NSCursor.pop()
-        }
+    Button(action: action) {
+      Image(systemName: "xmark")
+        .font(.system(size: 10, weight: .bold))
+        .foregroundStyle(.secondary)
+        .frame(width: 20, height: 20)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .onHover { inside in
+      if inside {
+        NSCursor.arrow.push()
+      } else {
+        NSCursor.pop()
       }
+    }
   }
 }
 

@@ -157,7 +157,34 @@ struct GeneralSectionView: View {
 				Image(systemName: "cpu")
 			}
 
-			if store.hexSettings.continuousListeningBackend == .streaming {
+			if store.hexSettings.continuousListeningBackend == .chunked {
+			Label {
+				Toggle("Segment Splitting", isOn: $store.hexSettings.segmentSplittingEnabled)
+				Text("Split text into segments after silence pauses during continuous dictation.")
+					.settingsCaption()
+			} icon: {
+				Image(systemName: "waveform.path")
+			}
+
+			if store.hexSettings.segmentSplittingEnabled {
+				Label {
+					HStack {
+						Text("Segment Silence")
+						Spacer()
+						Stepper(
+							"\(store.hexSettings.segmentSilenceThreshold, specifier: "%.1f")s",
+							value: $store.hexSettings.segmentSilenceThreshold,
+							in: 0.5...10.0,
+							step: 0.5
+						)
+					}
+				} icon: {
+					Image(systemName: "timer")
+				}
+			}
+		}
+
+		if store.hexSettings.continuousListeningBackend == .streaming {
 				Label {
 					HStack {
 						Text("Confirmation Delay")

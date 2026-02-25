@@ -38,6 +38,7 @@ struct TextBlock: Equatable, Identifiable {
   var text: String
   var status: Status
   let timestamp: Date
+  var isSessionStart: Bool = false
 
   enum Status: Equatable {
     case transcribing
@@ -55,7 +56,7 @@ struct ContinuousListeningFeature {
   }
 
   @ObservableState
-  struct State {
+  struct State: Equatable {
     var isActive: Bool = false
     var panelVisible: Bool = false
     var recordingMode: RecordingMode = .idle
@@ -66,6 +67,12 @@ struct ContinuousListeningFeature {
     var sourceAppName: String?
     var error: String?
     var hasCaptureError: Bool = false
+    var activeSegmentID: UUID? = nil
+    var lastChunkTimestamp: Date? = nil
+    var pendingChunkIDs: Set<UUID> = []
+    var sessionHasProducedBlocks: Bool = false
+    var sessionDividerVisible: Bool = false
+    var isAwaitingDispatch: Bool = false
     @Shared(.isContinuousListeningActive) var isContinuousListeningActive: Bool = false
   }
 
@@ -87,10 +94,11 @@ struct ContinuousListeningFeature {
     case streamingError(String)
     // Chunked mode
     case chunkReceived([AVAudioPCMBuffer])
-    case chunkTranscribed(UUID, String)
-    case chunkFailed(UUID, String)
+    case chunkTranscribed(blockID: UUID, chunkID: UUID, text: String)
+    case chunkFailed(blockID: UUID, chunkID: UUID, message: String)
     case interimTimerFired
     case interimTranscriptionResult(String)
+    case segmentSilenceExceeded
     // Common
     case captureError(String)
     case retryCapture
@@ -110,6 +118,7 @@ struct ContinuousListeningFeature {
     case watchdog
     case recovery
     case deferredPTTStop
+    case segmentSilenceTimer
   }
 
   @Dependency(\.streamingAudio) var streamingAudio
@@ -117,6 +126,7 @@ struct ContinuousListeningFeature {
   @Dependency(\.transcription) var transcription
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.soundEffects) var soundEffects
+  @Dependency(\.date) var date
   @Shared(.hexSettings) var hexSettings: HexSettings
 
   var body: some ReducerOf<Self> {
@@ -157,6 +167,12 @@ struct ContinuousListeningFeature {
         state.textBlocks = []
         state.interimText = nil
         state.error = nil
+        state.activeSegmentID = nil
+        state.lastChunkTimestamp = nil
+        state.pendingChunkIDs = []
+        state.sessionHasProducedBlocks = false
+        state.sessionDividerVisible = false
+        state.isAwaitingDispatch = false
         logger.notice("Panel hidden, text cleared")
         if state.isActive {
           return .send(.stopListening)
@@ -220,6 +236,10 @@ struct ContinuousListeningFeature {
         state.meterLevel = 0
         state.error = nil
         state.interimText = nil
+        state.activeSegmentID = nil
+        state.lastChunkTimestamp = nil
+        state.sessionHasProducedBlocks = false
+        state.sessionDividerVisible = false
 
         let model = hexSettings.selectedModel
         let backend = hexSettings.continuousListeningBackend
@@ -272,9 +292,11 @@ struct ContinuousListeningFeature {
         state.isActive = false
         state.hasCaptureError = false
         state.$isContinuousListeningActive.withLock { $0 = false }
-        state.interimText = nil
+        // Don't clear interimText — let in-flight transcriptions replace it
         state.meterLevel = 0
         state.error = nil
+        state.activeSegmentID = nil
+        state.lastChunkTimestamp = nil
 
         return .merge(
           .cancel(id: CancelID.meterObservation),
@@ -285,6 +307,7 @@ struct ContinuousListeningFeature {
           .cancel(id: CancelID.interimTranscription),
           .cancel(id: CancelID.watchdog),
           .cancel(id: CancelID.recovery),
+          .cancel(id: CancelID.segmentSilenceTimer),
           .cancel(id: CancelID.listening),
           .run { _ in
             await streamingTranscription.cancel()
@@ -339,54 +362,127 @@ struct ContinuousListeningFeature {
       // MARK: - Chunked Mode Updates
 
       case let .chunkReceived(buffers):
-        let blockID = UUID()
-        let block = TextBlock(
-          id: blockID,
-          text: "",
-          status: .transcribing,
-          timestamp: Date()
-        )
-        state.textBlocks.append(block)
+        let now = date.now
+        let splittingDisabled = state.recordingMode == .pushToTalk || !hexSettings.segmentSplittingEnabled
+        let threshold = hexSettings.segmentSilenceThreshold
+        let elapsed = state.lastChunkTimestamp.map { now.timeIntervalSince($0) }
+        let wasDividerVisible = state.sessionDividerVisible
+        state.lastChunkTimestamp = now
+        state.sessionDividerVisible = false
+
+        let chunkID = UUID()
+        state.pendingChunkIDs.insert(chunkID)
+
+        let blockID: UUID
+        // When splitting is disabled (PTT or toggle off), always merge into the active segment
+        if splittingDisabled, let activeID = state.activeSegmentID,
+           state.textBlocks[id: activeID] != nil {
+          blockID = activeID
+          state.textBlocks[id: blockID]?.status = .transcribing
+        } else if !splittingDisabled, !wasDividerVisible, let elapsed, elapsed < threshold,
+           let activeID = state.activeSegmentID,
+           state.textBlocks[id: activeID] != nil {
+          // Continuous mode with splitting: merge if within silence threshold
+          blockID = activeID
+          state.textBlocks[id: blockID]?.status = .transcribing
+        } else {
+          // New segment
+          blockID = UUID()
+          let isSessionStart = !splittingDisabled
+            && (wasDividerVisible || (!state.sessionHasProducedBlocks && !state.textBlocks.isEmpty))
+          let block = TextBlock(
+            id: blockID,
+            text: "",
+            status: .transcribing,
+            timestamp: now,
+            isSessionStart: isSessionStart
+          )
+          state.textBlocks.append(block)
+          state.activeSegmentID = blockID
+          state.sessionHasProducedBlocks = true
+        }
         state.interimText = nil
 
         let model = hexSettings.selectedModel
         let language = hexSettings.outputLanguage
 
-        return .run { send in
-          do {
-            let url = try AudioBufferWriter.write(buffers: buffers)
-            defer { try? FileManager.default.removeItem(at: url) }
+        var effects: [Effect<Action>] = [
+          .run { send in
+            do {
+              let url = try AudioBufferWriter.write(buffers: buffers)
+              defer { try? FileManager.default.removeItem(at: url) }
 
-            let decodeOptions = DecodingOptions(
-              language: language,
-              detectLanguage: language == nil,
-              chunkingStrategy: .vad
-            )
-            let text = try await transcription.transcribe(url, model, decodeOptions) { _ in }
-            await send(.chunkTranscribed(blockID, text))
-          } catch {
-            await send(.chunkFailed(blockID, error.localizedDescription))
-          }
+              let decodeOptions = DecodingOptions(
+                language: language,
+                detectLanguage: language == nil,
+                chunkingStrategy: .vad
+              )
+              let text = try await transcription.transcribe(url, model, decodeOptions) { _ in }
+              await send(.chunkTranscribed(blockID: blockID, chunkID: chunkID, text: text))
+            } catch {
+              await send(.chunkFailed(blockID: blockID, chunkID: chunkID, message: error.localizedDescription))
+            }
+          },
+        ]
+
+        // Only run segment silence timer when splitting is enabled
+        if !splittingDisabled {
+          effects.append(
+            .run { [threshold] send in
+              try await Task.sleep(for: .seconds(threshold))
+              await send(.segmentSilenceExceeded)
+            }
+            .cancellable(id: CancelID.segmentSilenceTimer, cancelInFlight: true)
+          )
         }
 
-      case let .chunkTranscribed(blockID, text):
+        return .merge(effects)
+
+      case let .chunkTranscribed(blockID, chunkID, text):
+        state.pendingChunkIDs.remove(chunkID)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-          state.textBlocks.remove(id: blockID)
+          // If block text is still empty and no more pending chunks, remove the block
+          if let block = state.textBlocks[id: blockID],
+             block.text.isEmpty && state.pendingChunkIDs.isEmpty {
+            state.textBlocks.remove(id: blockID)
+            if state.activeSegmentID == blockID { state.activeSegmentID = nil }
+          }
+          // Auto-dispatch if we were waiting for transcriptions to complete
+          if state.pendingChunkIDs.isEmpty && state.isAwaitingDispatch {
+            return .send(.dispatchText)
+          }
           return .none
         }
 
         let output = applyTextProcessing(trimmed)
-        state.textBlocks[id: blockID]?.text = output
-        state.textBlocks[id: blockID]?.status = .complete
+        if let existing = state.textBlocks[id: blockID]?.text, !existing.isEmpty {
+          state.textBlocks[id: blockID]?.text = existing + " " + output
+        } else {
+          state.textBlocks[id: blockID]?.text = output
+        }
+        if state.pendingChunkIDs.isEmpty {
+          state.textBlocks[id: blockID]?.status = .complete
+        }
 
         let totalChars = state.textBlocks.filter { $0.status == .complete }.reduce(0) { $0 + $1.text.count }
         logger.notice("Chunk transcribed (\(totalChars) total chars): \(output, privacy: .private)")
+
+        // Auto-dispatch if we were waiting for transcriptions to complete
+        if state.pendingChunkIDs.isEmpty && state.isAwaitingDispatch {
+          return .send(.dispatchText)
+        }
         return .none
 
-      case let .chunkFailed(blockID, message):
+      case let .chunkFailed(blockID, chunkID, message):
+        state.pendingChunkIDs.remove(chunkID)
         state.textBlocks[id: blockID]?.status = .error(message)
         logger.error("Chunk transcription failed: \(message)")
+
+        // Auto-dispatch if we were waiting for transcriptions to complete
+        if state.pendingChunkIDs.isEmpty && state.isAwaitingDispatch {
+          return .send(.dispatchText)
+        }
         return .none
 
       case .interimTimerFired:
@@ -421,6 +517,14 @@ struct ContinuousListeningFeature {
         }
         return .none
 
+      case .segmentSilenceExceeded:
+        // Only show divider if we've produced blocks in this session
+        guard state.sessionHasProducedBlocks else { return .none }
+        state.sessionDividerVisible = true
+        state.activeSegmentID = nil
+        logger.notice("Segment silence exceeded — session divider shown")
+        return .none
+
       // MARK: - Common
 
       case let .captureError(message):
@@ -436,6 +540,7 @@ struct ContinuousListeningFeature {
           .cancel(id: CancelID.interimTimer),
           .cancel(id: CancelID.interimTranscription),
           .cancel(id: CancelID.watchdog),
+          .cancel(id: CancelID.segmentSilenceTimer),
           .run { _ in
             await streamingTranscription.cancel()
             await streamingAudio.stopCapture()
@@ -502,20 +607,42 @@ struct ContinuousListeningFeature {
         state.textBlocks = []
         state.interimText = nil
         state.error = nil
+        state.activeSegmentID = nil
+        state.lastChunkTimestamp = nil
+        state.pendingChunkIDs = []
+        state.sessionHasProducedBlocks = false
+        state.sessionDividerVisible = false
+        state.isAwaitingDispatch = false
         logger.notice("Cleared \(blockCount) text blocks")
-        return .none
+        return .cancel(id: CancelID.segmentSilenceTimer)
 
       case .dispatchText:
-        let text = state.textBlocks
-          .filter { $0.status == .complete }
-          .map(\.text)
-          .joined(separator: " ")
-          .trimmingCharacters(in: .whitespacesAndNewlines)
+        // If transcriptions are still in flight, defer dispatch until they complete
+        if !state.pendingChunkIDs.isEmpty {
+          state.isAwaitingDispatch = true
+          let pendingCount = state.pendingChunkIDs.count
+          logger.notice("Dispatch deferred — waiting for \(pendingCount) pending transcription(s)")
+          return .none
+        }
+        state.isAwaitingDispatch = false
+
+        var text = ""
+        for block in state.textBlocks where block.status == .complete {
+          if !text.isEmpty {
+            text += block.isSessionStart ? "\n" : " "
+          }
+          text += block.text
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .none }
 
         // Clear completed blocks
         state.textBlocks = state.textBlocks.filter { $0.status != .complete }
         logger.notice("Dispatching \(text.count) characters to target app")
+
+        let modeDesc = String(describing: state.recordingMode)
+        let active = state.isActive
+        logger.notice("Dispatching: recordingMode=\(modeDesc) isActive=\(active)")
 
         return .run { send in
           soundEffects.play(.pasteTranscript)
@@ -524,7 +651,14 @@ struct ContinuousListeningFeature {
         }
 
       case .textDispatched:
-        logger.notice("Text dispatched successfully")
+        // Reset segment tracking for the next batch of dictation
+        state.activeSegmentID = nil
+        state.lastChunkTimestamp = nil
+        state.sessionHasProducedBlocks = false
+        state.sessionDividerVisible = false
+        let dispatchedMode = String(describing: state.recordingMode)
+        let dispatchedActive = state.isActive
+        logger.notice("Text dispatched: recordingMode=\(dispatchedMode) isActive=\(dispatchedActive)")
         return .none
       }
     }
