@@ -12,11 +12,12 @@ import Foundation
 import HexCore
 
 private let logger = HexLog.continuousListening
+private let vadLogger = HexLog.vad
 
 @DependencyClient
 struct StreamingAudioClient {
   var startCapture: @Sendable () async throws -> Void
-  var stopCapture: @Sendable () async -> Void
+  var stopCapture: @Sendable () async -> Void  // stopCapture is async to allow VAD cleanup
   var flushBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
   var peekBuffers: @Sendable () async -> [AVAudioPCMBuffer] = { [] }
   var observeMeterLevels: @Sendable () -> AsyncStream<Float> = { .finished }
@@ -26,10 +27,11 @@ struct StreamingAudioClient {
 
 extension StreamingAudioClient: DependencyKey {
   static var liveValue: Self {
-    let live = StreamingAudioClientLive()
+    @Dependency(\.sileroVAD) var sileroVAD
+    let live = StreamingAudioClientLive(sileroVAD: sileroVAD)
     return Self(
       startCapture: { try await live.startCapture() },
-      stopCapture: { await live.stopCapture() },
+      stopCapture: { await live.stopCapture() },  // async for VAD cleanup
       flushBuffers: { await live.flushBuffers() },
       peekBuffers: { await live.peekBuffers() },
       observeMeterLevels: { live.startMeterStream() },
@@ -62,12 +64,26 @@ private actor StreamingAudioClientLive {
 
   // VAD-triggered chunk stream
   private var chunkContinuation: AsyncStream<[AVAudioPCMBuffer]>.Continuation?
-  private let silenceThreshold: Float = 0.01
+  private let onsetThreshold: Float = 0.5
+  private let offsetThreshold: Float = 0.35
+  private let minSpeechFrames: Int = 8  // ~0.25s at 512 samples/16kHz
   private let silenceDuration: TimeInterval = 0.4
   private var isVoiceActive: Bool = false
   private var silenceStart: Date?
   private var voiceStartTime: Date?
+  private var speechFrameCount: Int = 0
   private let maxChunkDuration: TimeInterval = 5.0
+
+  // Resampling for VAD (hardware rate → 16kHz mono)
+  private var vadConverter: AVAudioConverter?
+  private var vadResampleBuffer: [Float] = []
+
+  // Silero VAD client (injected from liveValue)
+  private let sileroVAD: SileroVADClient
+
+  init(sileroVAD: SileroVADClient) {
+    self.sileroVAD = sileroVAD
+  }
 
   // MARK: - Stream factories (nonisolated for sync access)
 
@@ -128,44 +144,112 @@ private actor StreamingAudioClientLive {
     meterContinuation?.yield(level)
   }
 
-  private func processVAD(level: Float) {
-    if level >= silenceThreshold {
-      if !isVoiceActive {
+  private func processVADProbability(_ probability: Float) {
+    if probability >= onsetThreshold {
+      speechFrameCount += 1
+      if !isVoiceActive, speechFrameCount >= minSpeechFrames {
+        isVoiceActive = true
         voiceStartTime = Date()
+        vadLogger.debug("Speech onset detected (prob=\(String(format: "%.2f", probability)))")
       }
-      isVoiceActive = true
       silenceStart = nil
 
       // Force-flush if voice has been active longer than maxChunkDuration
-      if let start = voiceStartTime, Date().timeIntervalSince(start) >= maxChunkDuration {
+      if isVoiceActive, let start = voiceStartTime, Date().timeIntervalSince(start) >= maxChunkDuration {
         if !buffers.isEmpty {
           chunkContinuation?.yield(buffers)
           buffers.removeAll()
         }
         voiceStartTime = Date()
       }
-    } else if isVoiceActive {
-      if silenceStart == nil {
-        silenceStart = Date()
-      }
-      if let start = silenceStart, Date().timeIntervalSince(start) >= silenceDuration {
-        // Silence exceeded threshold — flush chunk
-        if !buffers.isEmpty {
-          chunkContinuation?.yield(buffers)
-          buffers.removeAll()
+    } else if probability < offsetThreshold {
+      speechFrameCount = 0
+      if isVoiceActive {
+        if silenceStart == nil {
+          silenceStart = Date()
         }
-        isVoiceActive = false
-        silenceStart = nil
-        voiceStartTime = nil
+        if let start = silenceStart, Date().timeIntervalSince(start) >= silenceDuration {
+          vadLogger.debug("Speech offset detected (prob=\(String(format: "%.2f", probability)))")
+          if !buffers.isEmpty {
+            chunkContinuation?.yield(buffers)
+            buffers.removeAll()
+          }
+          isVoiceActive = false
+          silenceStart = nil
+          voiceStartTime = nil
+        }
       }
+    }
+  }
+
+  /// Resample audio buffer to 16kHz mono, accumulate samples, and run Silero VAD on each 512-sample window.
+  private func processVADBuffer(_ buffer: AVAudioPCMBuffer) async {
+    // Lazily create converter on first call
+    if vadConverter == nil {
+      let inputFormat = buffer.format
+      let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+      vadConverter = AVAudioConverter(from: inputFormat, to: outputFormat)
+      if vadConverter == nil {
+        vadLogger.error("Failed to create AVAudioConverter from \(inputFormat.sampleRate)Hz to 16kHz")
+        return
+      }
+    }
+    guard let converter = vadConverter else { return }
+
+    // Calculate output frame count based on sample rate ratio
+    let ratio = 16000.0 / buffer.format.sampleRate
+    let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+    guard outputFrameCount > 0,
+          let outputBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: outputFrameCount) else { return }
+
+    var error: NSError?
+    var consumed = false
+    converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+      if consumed {
+        outStatus.pointee = .noDataNow
+        return nil
+      }
+      consumed = true
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    if let error {
+      vadLogger.error("Resampling failed: \(error.localizedDescription)")
+      return
+    }
+
+    // Accumulate resampled samples
+    guard let channelData = outputBuffer.floatChannelData else { return }
+    let frameCount = Int(outputBuffer.frameLength)
+    let samples = channelData[0]
+    for i in 0..<frameCount {
+      vadResampleBuffer.append(samples[i])
+    }
+
+    // Process complete 512-sample windows
+    while vadResampleBuffer.count >= 512 {
+      let window = Array(vadResampleBuffer.prefix(512))
+      vadResampleBuffer.removeFirst(512)
+      let probability = await sileroVAD.processFrame(window)
+      processVADProbability(probability)
     }
   }
 
   // MARK: - Capture
 
-  func startCapture() throws {
+  func startCapture() async throws {
     // Select microphone if configured
     configureInputDevice()
+
+    // Load Silero VAD model
+    do {
+      try await sileroVAD.load()
+    } catch {
+      vadLogger.error("Failed to load Silero VAD, falling back to no VAD: \(error.localizedDescription)")
+    }
+    await sileroVAD.resetState()
+    vadResampleBuffer.removeAll()
+    vadConverter = nil
 
     let engine = AVAudioEngine()
     let inputNode = engine.inputNode
@@ -183,7 +267,7 @@ private actor StreamingAudioClientLive {
       Task {
         await self.appendBuffer(buffer)
         await self.emitMeterLevel(level)
-        await self.processVAD(level: level)
+        await self.processVADBuffer(buffer)
       }
     }
 
@@ -192,7 +276,7 @@ private actor StreamingAudioClientLive {
     logger.notice("Audio capture started")
   }
 
-  func stopCapture() {
+  func stopCapture() async {
     guard let engine else { return }
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
@@ -212,6 +296,10 @@ private actor StreamingAudioClientLive {
     rawBufferContinuation = nil
     isVoiceActive = false
     silenceStart = nil
+    speechFrameCount = 0
+    vadResampleBuffer.removeAll()
+    vadConverter = nil
+    await sileroVAD.resetState()
 
     logger.notice("Audio capture stopped")
   }

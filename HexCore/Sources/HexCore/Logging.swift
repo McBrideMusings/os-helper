@@ -20,6 +20,8 @@ public enum HexLog {
     case settings = "Settings"
     case permissions = "Permissions"
     case continuousListening = "ContinuousListening"
+    case vad = "VAD"
+    case mlx = "MLX"
   }
 
   public static func logger(_ category: Category) -> os.Logger {
@@ -41,4 +43,6 @@ public enum HexLog {
   public static let settings = logger(.settings)
   public static let permissions = logger(.permissions)
   public static let continuousListening = logger(.continuousListening)
+  public static let vad = logger(.vad)
+  public static let mlx = logger(.mlx)
 }

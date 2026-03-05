@@ -418,7 +418,7 @@ actor TranscriptionClientLive {
       tokenizerFolder: tokenizerFolder,
       // verbose: true,
       // logLevel: .debug,
-      prewarm: false,
+      prewarm: true,
       load: true
     )
 

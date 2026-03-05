@@ -97,6 +97,17 @@ actor ParakeetClient {
     self.asr = manager
     self.currentVariant = variant
     self.currentUseGPU = useGPU
+
+    // Warmup: dummy inference triggers CoreML graph compilation
+    do {
+      let warmupURL = try WarmupHelper.generateSilenceWAV()
+      _ = try? await manager.transcribe(warmupURL)
+      WarmupHelper.cleanup(warmupURL)
+      logger.info("Parakeet warmup completed")
+    } catch {
+      logger.warning("Parakeet warmup skipped: \(error.localizedDescription)")
+    }
+
     p.completedUnitCount = 100
     progress(p)
     logger.notice("Parakeet ensureLoaded completed in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
