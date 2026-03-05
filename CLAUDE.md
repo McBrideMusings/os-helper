@@ -25,11 +25,19 @@ Dependency chain: M1 → M2 → (M3 ∥ M4) → M5 → M6. See `gh issue list` f
 # Build the app
 xcodebuild -scheme Hex -configuration Release
 
+# Build and run with live log streaming (Ctrl+C to quit)
+./run.sh
+
 # Run tests (must be run from HexCore directory for unit tests)
 cd HexCore && swift test
 
 # Or run all tests via Xcode
 xcodebuild test -scheme Hex
+
+# Benchmark transcription engines (accepts WAV, M4A, MP3, etc.)
+./benchmark.sh ~/recording.m4a
+./benchmark.sh ~/recording.m4a --runs 5
+./benchmark.sh ~/recording.m4a --skip-whisper --compute cpu-ane
 
 # Open in Xcode (recommended for development)
 open Hex.xcodeproj
@@ -48,8 +56,8 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 
 ### Dependency Clients
 - `TranscriptionClient`: WhisperKit/Parakeet integration for ML transcription
-- `StreamingTranscriptionClient`: FluidAudio streaming ASR for live transcription
-- `StreamingAudioClient`: AVAudioEngine-based capture with VAD chunking and raw buffer streams
+- `StreamingAudioClient`: AVAudioEngine-based capture with Silero VAD chunking
+- `SileroVADClient`: Bundled Silero VAD CoreML model for speech probability detection
 - `RecordingClient`: AVAudioRecorder wrapper for audio capture
 - `ParakeetClient`: FluidAudio model loading with configurable compute units (GPU/ANE)
 - `PasteboardClient`: Clipboard operations
@@ -79,14 +87,16 @@ The app uses **The Composable Architecture (TCA)** for state management. Key arc
 
 5. **Permissions**: Requires audio input and automation entitlements (see `Hex.entitlements`)
 
-6. **Continuous Listening / Continuous Dictation**: Activated via double-tap hotkey (handled in `AppFeature`). Supports two backends configured via `HexSettings.continuousListeningBackend`:
-   - **Chunked (default)**: `StreamingAudioClient` does VAD-based silence detection and emits `[AVAudioPCMBuffer]` chunks. `ContinuousListeningFeature` writes each chunk to a temp WAV via `AudioBufferWriter`, then transcribes it through `TranscriptionClient` (works with both Parakeet and WhisperKit). An interim timer peeks at accumulated buffers every 1.5s for gray preview text.
-   - **Streaming**: Raw audio buffers are forwarded to `StreamingTranscriptionClient` which wraps FluidAudio's `StreamingAsrManager`. Produces volatile (gray) and confirmed text updates. Key tuning params: `streamingMinConfirmationContext` (default 3s) and `streamingConfirmationThreshold` (default 0.80).
-   - Both backends produce `TextBlock` items and optional `interimText` consumed by `ContinuousListeningPanel`.
+6. **Continuous Listening / Continuous Dictation**: Activated via double-tap hotkey (handled in `AppFeature`). Uses chunked VAD-based transcription:
+   - `StreamingAudioClient` resamples hardware audio to 16kHz mono, feeds 512-sample windows to `SileroVADClient` (bundled CoreML model at `Hex/Resources/Models/silero_vad.mlmodelc`), and uses probability-based onset/offset detection (onset ≥ 0.5, offset < 0.35, min 8 frames) to emit `[AVAudioPCMBuffer]` chunks.
+   - `ContinuousListeningFeature` writes each chunk to a temp WAV via `AudioBufferWriter`, then transcribes it through `TranscriptionClient` (works with both Parakeet and WhisperKit). An interim timer peeks at accumulated buffers every 1.5s for gray preview text.
+   - Produces `TextBlock` items and optional `interimText` consumed by `ContinuousListeningPanel`.
    - GPU acceleration toggle (`useGPUAcceleration`) routes Parakeet through `MLModelConfiguration.computeUnits = .all` vs `.cpuAndNeuralEngine`.
    - Settings UI lives in `GeneralSectionView` under "Continuous Dictation Engine".
 
-7. **Logging**: All diagnostics should use the unified logging helper `HexLog` (`HexCore/Sources/HexCore/Logging.swift`). Pick an existing category (e.g., `.transcription`, `.recording`, `.settings`) or add a new case so Console predicates stay consistent. Avoid `print` and prefer privacy annotations (`, privacy: .private`) for anything potentially sensitive like transcript text or file paths.
+8. **Model Warmup**: Both Parakeet and WhisperKit run a warmup inference after model load to trigger CoreML graph compilation, eliminating the cold-start penalty on the first real transcription. See `WarmupHelper.swift` for the silence WAV generator.
+
+7. **Logging**: All diagnostics should use the unified logging helper `HexLog` (`HexCore/Sources/HexCore/Logging.swift`). Pick an existing category (e.g., `.transcription`, `.recording`, `.vad`, `.settings`) or add a new case so Console predicates stay consistent. Avoid `print` and prefer privacy annotations (`, privacy: .private`) for anything potentially sensitive like transcript text or file paths.
 
 ## Models (2025‑11)
 
