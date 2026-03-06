@@ -12,8 +12,8 @@ class ContinuousListeningPanel: NSPanel {
   override var canBecomeMain: Bool { false }
 
   init(store: StoreOf<ContinuousListeningFeature>) {
-    let panelWidth: CGFloat = 320
-    let panelHeight: CGFloat = 200
+    let panelWidth: CGFloat = 260
+    let panelHeight: CGFloat = 160
 
     let screen = NSScreen.main ?? NSScreen.screens[0]
     let x = screen.visibleFrame.midX - panelWidth / 2
@@ -57,263 +57,108 @@ struct ContinuousListeningOverlayView: View {
   private var hasError: Bool { store.hasCaptureError }
 
   private var statusText: String {
-    if store.isAwaitingDispatch { return "Sending..." }
     if hasError { return "Error" }
-    switch store.recordingMode {
-    case .idle: return "Ready"
-    case .pushToTalk: return "Recording..."
-    case .continuous: return "Listening..."
-    }
+    if store.emissionMode != .inactive { return "Typing" }
+    return "Listening"
   }
 
-  private var isRecording: Bool {
-    store.recordingMode != .idle
+  private var isEmitting: Bool {
+    store.emissionMode != .inactive
+  }
+
+  private var sessionDuration: String? {
+    guard let start = store.sessionStartTime else { return nil }
+    let elapsed = Int(Date().timeIntervalSince(start))
+    let minutes = elapsed / 60
+    let seconds = elapsed % 60
+    return String(format: "%d:%02d", minutes, seconds)
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      // Header
-      HStack(spacing: 6) {
-        if store.isAwaitingDispatch {
-          ProgressView()
-            .controlSize(.small)
-            .frame(width: 8, height: 8)
-        } else if hasError {
-          Circle()
-            .fill(.gray)
-            .frame(width: 8, height: 8)
-          AudioLevelBars(level: 0, disabled: true)
-        } else if isRecording {
-          PulsingDot()
-          AudioLevelBars(level: store.meterLevel)
-        } else {
-          Circle()
-            .fill(.gray.opacity(0.5))
-            .frame(width: 8, height: 8)
-          AudioLevelBars(level: 0, disabled: true)
-        }
-        Text(statusText)
-          .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(isRecording ? .primary : .secondary)
-        Spacer()
-        // Close button
-        CloseButton { store.send(.hidePanel) }
-      }
+    VStack(spacing: 0) {
+      statusBar
 
       Divider()
+        .opacity(0.3)
 
-      // Body — flowing paragraph
-      ScrollViewReader { proxy in
-        ScrollView(.vertical, showsIndicators: false) {
-          FlowingTextView(
-            textBlocks: store.textBlocks,
-            interimText: store.interimText,
-            isCapturingAudio: !hasError && store.meterLevel > 0.05,
-            sessionDividerVisible: store.sessionDividerVisible
-          )
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .id("bottom")
-        }
-        .onChange(of: store.textBlocks.count) {
-          withAnimation {
-            proxy.scrollTo("bottom", anchor: .bottom)
+      // Transcript: chronological top-to-bottom, current utterance at the bottom edge.
+      // Old text at top fades out. Overflow clips at top.
+      GeometryReader { geo in
+        VStack(alignment: .leading, spacing: 3) {
+          // Committed entries — chronological (oldest at top, newest at bottom)
+          ForEach(store.transcriptEntries) { entry in
+            let age = Date().timeIntervalSince(entry.timestamp)
+            let fadeOpacity: Double = age < 10 ? 1.0 : age > 60 ? 0.0 : 1.0 - (age - 10) / 50.0
+            Text(entry.text)
+              .font(.system(size: 11))
+              .foregroundStyle(.primary)
+              .opacity(fadeOpacity)
+          }
+
+          // Live utterance at the bottom — gray italic, continuously updating
+          if !store.currentUtteranceText.isEmpty {
+            Text(store.currentUtteranceText)
+              .font(.system(size: 11))
+              .italic()
+              .foregroundStyle(.secondary)
           }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Pin content to the bottom so it grows upward
+        .frame(height: nil)
+        .frame(maxHeight: .infinity, alignment: .bottom)
       }
-
-      // Error
-      if let error = store.error {
-        Text(error)
-          .font(.system(size: 10))
-          .foregroundStyle(.red)
-          .lineLimit(3)
-      }
-
-      Divider()
-
-      // Footer
-      HStack {
-        MicButton(recordingMode: store.recordingMode) {
-          store.send(.startPushToTalk)
-        } onRelease: {
-          store.send(.stopPushToTalk)
-        } onDoubleTap: {
-          store.send(.toggleContinuousMode)
+      .clipped()
+      .mask(
+        VStack(spacing: 0) {
+          // Fade old text at top
+          LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+            .frame(height: 20)
+          Color.black
         }
-        Spacer()
-        TextDragHandle(textBlocks: store.textBlocks)
-      }
+      )
     }
-    .padding(12)
-    .frame(width: 320)
-    .frame(minHeight: 100, maxHeight: 240)
+    .frame(width: 260, height: 160)
     .background(.ultraThinMaterial)
-    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-  }
-}
-
-// MARK: - Flowing Text View
-
-private struct FlowingTextView: View {
-  let textBlocks: IdentifiedArrayOf<TextBlock>
-  let interimText: String?
-  let isCapturingAudio: Bool
-  var sessionDividerVisible: Bool = false
-
-  /// Timestamps when each word first appeared, keyed by global word index.
-  @State private var wordAppearTimes: [Int: Date] = [:]
-  /// Tracks the last known total so we can detect clears.
-  @State private var lastKnownTotal: Int = 0
-  /// Tick counter to drive re-renders for the fade.
-  @State private var tick: Int = 0
-  @State private var tickTask: Task<Void, Never>?
-
-  /// How long a word stays gray before it's fully white.
-  private let settleDuration: TimeInterval = 0.8
-
-  private var totalCompletedWords: Int {
-    textBlocks.filter { $0.status == .complete }
-      .reduce(0) { $0 + $1.text.split(separator: " ").count }
+    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
   }
 
-  /// True when we've received audio that hasn't finished transcribing yet.
-  private var isTranscribing: Bool {
-    textBlocks.contains(where: { $0.status == .transcribing })
-      || isCapturingAudio
-  }
-
-  private var showEllipsis: Bool {
-    interimText != nil || isTranscribing
-  }
-
-  var body: some View {
-    let hasContent = !textBlocks.isEmpty || interimText != nil || isCapturingAudio
-    if !hasContent {
-      Text("Press record or use hotkey to start")
-        .font(.system(size: 13))
-        .foregroundStyle(.tertiary)
-        .italic()
-    } else {
-      (buildFlowingText() + (showEllipsis ? Text(" ") : Text("")))
-        .font(.system(size: 13))
-        .textSelection(.enabled)
-        .onAppear { startTicking() }
-        .onDisappear { tickTask?.cancel() }
-        .onChange(of: totalCompletedWords) { _, newTotal in
-          if newTotal < lastKnownTotal {
-            wordAppearTimes.removeAll()
-            lastKnownTotal = 0
-          }
-          let now = Date()
-          let staggerDelay: TimeInterval = 0.06
-          for i in lastKnownTotal..<newTotal {
-            if wordAppearTimes[i] == nil {
-              wordAppearTimes[i] = now + Double(i - lastKnownTotal) * staggerDelay
-            }
-          }
-          lastKnownTotal = newTotal
-        }
-        .overlay(alignment: .trailingLastTextBaseline) {
-          if showEllipsis {
-            AnimatedEllipsis()
-              .font(.system(size: 13))
-          }
-        }
-    }
-  }
-
-  /// Ticks every 100ms to drive smooth color transitions.
-  private func startTicking() {
-    tickTask?.cancel()
-    tickTask = Task { @MainActor in
-      while !Task.isCancelled {
-        try? await Task.sleep(for: .milliseconds(100))
-        tick += 1
-      }
-    }
-  }
-
-  private func wordOpacity(at globalIndex: Int) -> Double {
-    // Force dependency on tick so we re-render
-    _ = tick
-    guard let appeared = wordAppearTimes[globalIndex] else { return 0.5 }
-    let elapsed = Date().timeIntervalSince(appeared)
-    let progress = min(elapsed / settleDuration, 1.0)
-    // Interpolate from 0.5 (gray) to 1.0 (white)
-    return 0.5 + progress * 0.5
-  }
-
-  private func buildFlowingText() -> Text {
-    var globalWordIndex = 0
-    var result = textBlocks.enumerated().reduce(Text("")) { acc, pair in
-      let (index, block) = pair
-      let separator: Text
-      if index == 0 {
-        separator = Text("")
-      } else if block.isSessionStart {
-        separator = Text("\n─────────\n").foregroundColor(.secondary.opacity(0.3))
+  private var statusBar: some View {
+    HStack(spacing: 6) {
+      if hasError {
+        Circle()
+          .fill(.gray)
+          .frame(width: 8, height: 8)
       } else {
-        separator = Text(" ")
+        PulsingDot()
+        AudioLevelBars(level: store.meterLevel)
       }
-      switch block.status {
-      case .complete:
-        let words = block.text.split(separator: " ")
-        var blockText = Text("")
-        for (wi, word) in words.enumerated() {
-          let wordSep = wi > 0 ? Text(" ") : Text("")
-          let opacity = wordOpacity(at: globalWordIndex)
-          blockText = blockText + wordSep + Text(word)
-            .foregroundColor(.primary.opacity(opacity))
-          globalWordIndex += 1
-        }
-        return acc + separator + blockText
-      case .transcribing:
-        return acc + separator + Text("...")
-          .foregroundColor(.secondary)
-      case .error(let message):
-        return acc + separator + Text(message)
-          .foregroundColor(.red)
+
+      Text(statusText)
+        .font(.system(size: 11, weight: .semibold))
+        .foregroundStyle(.primary)
+
+      if isEmitting {
+        Image(systemName: "pencil")
+          .font(.system(size: 10, weight: .semibold))
+          .foregroundStyle(.orange)
       }
-    }
 
-    // Show trailing session divider when silence threshold exceeded
-    if sessionDividerVisible && !textBlocks.isEmpty {
-      result = result + Text("\n─────────").foregroundColor(.secondary.opacity(0.3))
-    }
+      Spacer()
 
-    if let interim = interimText {
-      let separator: Text
-      if textBlocks.isEmpty {
-        separator = Text("")
-      } else if sessionDividerVisible {
-        separator = Text("\n")
-      } else {
-        separator = Text(" ")
+      if let duration = sessionDuration {
+        Text(duration)
+          .font(.system(size: 10, weight: .medium, design: .monospaced))
+          .foregroundStyle(.tertiary)
       }
-      result = result + separator + Text(interim)
-        .foregroundColor(.secondary.opacity(0.7))
+
+      CloseButton { store.send(.hidePanel) }
     }
-
-    return result
-  }
-}
-
-// MARK: - Animated Ellipsis
-
-private struct AnimatedEllipsis: View {
-  @State private var dotCount = 0
-
-  var body: some View {
-    TimelineView(.periodic(from: .now, by: 0.4)) { timeline in
-      let dots = dotCountFor(timeline.date)
-      Text(String(repeating: ".", count: dots))
-        .foregroundColor(.secondary.opacity(0.4))
-    }
-  }
-
-  private func dotCountFor(_ date: Date) -> Int {
-    let cycle = Int(date.timeIntervalSinceReferenceDate / 0.4) % 3
-    return cycle + 1
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .frame(height: 40)
   }
 }
 
@@ -343,85 +188,6 @@ private struct AudioLevelBars: View {
     let maxHeight: CGFloat = 16
     let scaled = CGFloat(level * weight)
     return minHeight + scaled * (maxHeight - minHeight)
-  }
-}
-
-// MARK: - Mic Button
-
-private struct MicButton: View {
-  let recordingMode: ContinuousListeningFeature.RecordingMode
-  let onPress: () -> Void
-  let onRelease: () -> Void
-  let onDoubleTap: () -> Void
-
-  @State private var isPressed = false
-
-  private var isRecording: Bool {
-    recordingMode != .idle
-  }
-
-  var body: some View {
-    Image(systemName: isRecording ? "mic.fill" : "mic")
-      .font(.system(size: 14, weight: .medium))
-      .foregroundStyle(isRecording ? .red : .secondary)
-      .frame(width: 28, height: 28)
-      .background(
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
-          .fill(isRecording ? Color.red.opacity(0.15) : Color.clear)
-      )
-      .scaleEffect(isPressed ? 0.9 : 1.0)
-      .animation(.easeInOut(duration: 0.1), value: isPressed)
-      .contentShape(Rectangle())
-      .onTapGesture(count: 2) {
-        onDoubleTap()
-      }
-      .simultaneousGesture(
-        DragGesture(minimumDistance: 0)
-          .onChanged { _ in
-            if !isPressed {
-              isPressed = true
-              onPress()
-            }
-          }
-          .onEnded { _ in
-            isPressed = false
-            onRelease()
-          }
-      )
-  }
-}
-
-// MARK: - Text Drag Handle
-
-private struct TextDragHandle: View {
-  let textBlocks: IdentifiedArrayOf<TextBlock>
-
-  private var fullText: String {
-    var text = ""
-    for block in textBlocks where block.status == .complete {
-      if !text.isEmpty {
-        text += block.isSessionStart ? "\n" : " "
-      }
-      text += block.text
-    }
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
-  }
-
-  var body: some View {
-    let hasText = !fullText.isEmpty
-    Image(systemName: "line.3.horizontal")
-      .font(.system(size: 12, weight: .medium))
-      .foregroundStyle(hasText ? .secondary : .quaternary)
-      .frame(width: 28, height: 28)
-      .contentShape(Rectangle())
-      .draggable(fullText) {
-        Text(String(fullText.prefix(60)) + (fullText.count > 60 ? "..." : ""))
-          .font(.system(size: 11))
-          .padding(6)
-          .background(.ultraThinMaterial)
-          .clipShape(RoundedRectangle(cornerRadius: 6))
-      }
-      .disabled(!hasText)
   }
 }
 

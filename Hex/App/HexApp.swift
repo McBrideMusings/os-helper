@@ -61,9 +61,13 @@ struct HexApp: App {
 struct ContinuousListeningToggle: View {
 	var body: some View {
 		let store = HexApp.appStore
-		let isActive = store.state.continuousListening.isActive
-		Button(isActive ? "Stop Continuous Listening" : "Continuous Listening...") {
-			store.send(.continuousListening(.toggleMode))
+		let panelVisible = store.state.continuousListening.panelVisible
+		Button(panelVisible ? "Stop Continuous Listening" : "Continuous Listening...") {
+			if panelVisible {
+				store.send(.continuousListening(.hidePanel))
+			} else {
+				store.send(.continuousListening(.showPanel))
+			}
 		}
 	}
 }

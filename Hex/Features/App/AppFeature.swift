@@ -90,7 +90,6 @@ struct AppFeature {
       case .task:
         return .merge(
           startPasteLastTranscriptMonitoring(),
-          startContinuousListeningMouseButtonMonitoring(),
           ensureSelectedModelReadiness(),
           startPermissionMonitoring()
         )
@@ -109,35 +108,35 @@ struct AppFeature {
 
       case .transcription(.hotKeyPressed):
         let panelVis = state.continuousListening.panelVisible
-        let mode = state.continuousListening.recordingMode
-        appFeatureLogger.notice("hotKeyPressed → showPanel + startPushToTalk (panelVisible=\(panelVis) recordingMode=\(String(describing: mode)))")
-        return .merge(
-          .send(.continuousListening(.showPanel)),
-          .send(.continuousListening(.startPushToTalk))
-        )
+        let mode = state.continuousListening.emissionMode
+        appFeatureLogger.notice("hotKeyPressed (panelVisible=\(panelVis) emissionMode=\(String(describing: mode)))")
+        if !state.continuousListening.panelVisible {
+          return .send(.continuousListening(.showPanel))
+        }
+        return .send(.continuousListening(.startEmission(.pushToTalk)))
 
       case .transcription(.hotKeyReleased):
-        let mode = state.continuousListening.recordingMode
-        appFeatureLogger.notice("hotKeyReleased (recordingMode=\(String(describing: mode)))")
-        if state.continuousListening.recordingMode == .pushToTalk {
-          return .send(.continuousListening(.stopPushToTalk))
+        let mode = state.continuousListening.emissionMode
+        appFeatureLogger.notice("hotKeyReleased (emissionMode=\(String(describing: mode)))")
+        if state.continuousListening.emissionMode == .pushToTalk {
+          return .send(.continuousListening(.stopEmission))
         }
         return .none
 
       case .transcription(.hotKeyDoubleTapped):
         let panelVis = state.continuousListening.panelVisible
-        let mode = state.continuousListening.recordingMode
-        appFeatureLogger.notice("hotKeyDoubleTapped → showPanel + toggleContinuousMode (panelVisible=\(panelVis) recordingMode=\(String(describing: mode)))")
-        return .merge(
-          .send(.continuousListening(.showPanel)),
-          .send(.continuousListening(.toggleContinuousMode))
-        )
+        appFeatureLogger.notice("hotKeyDoubleTapped (panelVisible=\(panelVis))")
+        if !state.continuousListening.panelVisible {
+          return .merge(
+            .send(.continuousListening(.showPanel)),
+            .send(.continuousListening(.startEmission(.continuous)))
+          )
+        }
+        return .send(.continuousListening(.startEmission(.continuous)))
 
       case .transcription(.cancel):
-        // If the panel is visible, ESC stops recording but keeps panel open
-        if state.continuousListening.panelVisible, state.continuousListening.isActive {
-          state.continuousListening.recordingMode = .idle
-          return .send(.continuousListening(.stopListening))
+        if state.continuousListening.panelVisible {
+          return .send(.continuousListening(.hidePanel))
         }
         return .none
 
@@ -299,114 +298,6 @@ struct AppFeature {
     }
   }
 
-  private func startContinuousListeningMouseButtonMonitoring() -> Effect<Action> {
-    .run { send in
-      @Shared(.hexSettings) var hexSettings: HexSettings
-
-      // Track timestamp of last left double-click for "double-double-click to send"
-      nonisolated(unsafe) var lastLeftDoubleClickTime: ContinuousClock.Instant? = nil
-
-      let token = keyEventMonitor.handleInputEvent { inputEvent in
-        // Only handle when continuous listening panel is visible
-        let store = HexApp.appStore
-        guard store.state.continuousListening.panelVisible else {
-          return false
-        }
-
-        switch inputEvent {
-        case let .mouseButton(buttonNumber):
-          let action: MouseButtonAction
-          switch buttonNumber {
-          case 3: action = hexSettings.mouseButton3Action
-          case 4: action = hexSettings.mouseButton4Action
-          default: return false
-          }
-
-          switch action {
-          case .none:
-            return false
-          case .sendText:
-            MainActor.assumeIsolated {
-              send(.continuousListening(.dispatchText))
-            }
-            return true
-          case .clearText:
-            MainActor.assumeIsolated {
-              send(.continuousListening(.clearText))
-            }
-            return true
-          }
-
-        case .leftDoubleClick:
-          guard hexSettings.doubleDoubleClickToSend else { return false }
-          let now = ContinuousClock.now
-          if let last = lastLeftDoubleClickTime, now - last < .milliseconds(600) {
-            // Second double-click within window — send text
-            lastLeftDoubleClickTime = nil
-            MainActor.assumeIsolated {
-              send(.continuousListening(.dispatchText))
-            }
-            return true  // Consume to prevent text selection
-          } else {
-            // First double-click — record timestamp, pass through
-            lastLeftDoubleClickTime = now
-            return false
-          }
-
-        case .rightDoubleClick:
-          guard hexSettings.doubleRightClickToClear else { return false }
-          MainActor.assumeIsolated {
-            send(.continuousListening(.clearText))
-          }
-          return true
-
-        default:
-          return false
-        }
-      }
-
-      defer { token.cancel() }
-
-      await withTaskCancellationHandler {
-        while !Task.isCancelled {
-          try? await Task.sleep(for: .seconds(60))
-        }
-      } onCancel: {
-        token.cancel()
-      }
-    }
-  }
-
-  private func startContinuousListeningEnterMonitoring() -> Effect<Action> {
-    .run { send in
-      let token = keyEventMonitor.handleKeyEvent { keyEvent in
-        guard let key = keyEvent.key, key == .return else {
-          return false
-        }
-
-        // Only intercept when continuous listening panel is visible
-        let store = HexApp.appStore
-        guard store.state.continuousListening.panelVisible else {
-          return false
-        }
-
-        MainActor.assumeIsolated {
-          send(.continuousListening(.dispatchText))
-        }
-        return true
-      }
-
-      defer { token.cancel() }
-
-      await withTaskCancellationHandler {
-        while !Task.isCancelled {
-          try? await Task.sleep(for: .seconds(60))
-        }
-      } onCancel: {
-        token.cancel()
-      }
-    }
-  }
 }
 
 
