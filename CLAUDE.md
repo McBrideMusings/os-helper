@@ -22,16 +22,19 @@ Dependency chain: M1 → M2 → (M3 ∥ M4) → M5 → M6. See `gh issue list` f
 ## Build & Development Commands
 
 ```bash
-# Build the app
-xcodebuild -scheme Hex -configuration Release
-
 # Build and run with live log streaming (Ctrl+C to quit)
-./run.sh
+./admin run
 
-# Run tests (must be run from HexCore directory for unit tests)
-cd HexCore && swift test
+# Build and run with debug-level logs
+./admin run --log debug
 
-# Or run all tests via Xcode
+# Run HexCore unit tests
+./admin test
+
+# Nuke DerivedData (stale build fix)
+./admin clean
+
+# Or run tests via Xcode
 xcodebuild test -scheme Hex
 
 # Benchmark transcription engines (accepts WAV, M4A, MP3, etc.)

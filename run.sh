@@ -12,7 +12,7 @@ if [ "$BUILD_STATUS" -ne 0 ]; then
 fi
 echo ""
 
-APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/Hex-*/Build/Products/Debug/Hex\ Dev.app -maxdepth 0 2>/dev/null | head -1)
+APP_PATH=$(xcodebuild -scheme Hex -configuration Debug -showBuildSettings 2>/dev/null | grep -m1 '^\s*BUILT_PRODUCTS_DIR' | awk '{print $3}')/Hex\ Dev.app
 
 if [ -z "$APP_PATH" ]; then
     echo "Error: Could not find built app"

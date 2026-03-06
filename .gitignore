@@ -20,6 +20,7 @@ FluidAudio/
 node_modules/
 .npm-cache/
 .tmp/
+tmp/
 
 # Claude
 .claude/
